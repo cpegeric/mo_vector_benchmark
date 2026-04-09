@@ -1,0 +1,22 @@
+{
+  "sql_modes": {
+    "m1_l2_only": {
+      "type": "l2_only",
+      "sql": "SELECT `file_id`, `id` FROM `{table}` ORDER BY l2_distance(`{emb_col}`, %s) ASC LIMIT %s"
+    },
+    "m2_l2_filter": {
+      "type": "l2_filter",
+      "sql": "SELECT `file_id`, `id`, l2_distance(`{emb_col}`, %s) AS dist FROM `{table}` WHERE `{filter_col}` = %s ORDER BY dist ASC LIMIT %s"
+    },
+    "m3_l2_filter_threshold": {
+      "type": "l2_filter_threshold",
+      "sql": "SELECT `file_id`, `id`, l2_distance(`{emb_col}`, %s) AS dist FROM `{table}` WHERE `{filter_col}` = %s AND l2_distance(`{emb_col}`, %s) <= {max_distance} ORDER BY dist ASC LIMIT %s",
+      "extra": { "max_distance": 1.77 }
+    }
+  },
+  "default": {
+    "table": "historical_file_blocks",
+    "emb_col": "embedding",
+    "filter_col": "file_id"
+  }
+}
