@@ -73,11 +73,11 @@ filter_mode 说明:
 
   # 初始化环境：创建数据库、创建表、导入数据、创建向量索引（IVF）
   python run_vector_test.py init --database jst_app --table historical_file_blocks \\
-    --data-file data.csv --create-db --create-table --create-index --index-type ivf
+    --data-file data.csv --create-db --create-table --create-index --index-type ivfflat
 
   # 一键完整流程：初始化 + 测试（自动生成数据、创建表、导入、建IVF索引、测试）
   python run_vector_test.py init -n 100k --distinct-file-ids 50 \\
-    --auto-generate --create-db --create-table --create-index --index-type ivf \\
+    --auto-generate --create-db --create-table --create-index --index-type ivfflat \\
     --sql-modes m1_l2_only m2_l2_filter --auto-run --concurrency 4
 """
 
@@ -615,6 +615,112 @@ def run_full_test(args):
     print("完整向量搜索测试流程")
     print("=" * 70)
 
+    # 加载配置
+    config = None
+    if hasattr(args, 'config') and args.config:
+        config = load_sql_config(args.config)
+    elif os.path.exists(DEFAULT_CONFIG_FILE):
+        config = load_sql_config()
+
+    # 阶段 A: 生成数据（如果 init 命令已生成则跳过）
+    if getattr(args, 'skip_data_gen', False):
+        print("\n[阶段 A] 跳过数据生成（init 命令已生成数据）")
+    else:
+        print("\n[阶段 A] 生成测试数据...")
+        data_file = f"test_data_{args.rows}.csv"
+
+        gen_args = argparse.Namespace(
+            rows=args.rows,
+            output=data_file,
+            distinct_file_ids=args.distinct_file_ids,
+            seed=42,
+            with_header=False,
+            five_column=False,
+        )
+
+        ret = run_generate(gen_args)
+        if ret != 0:
+            print("错误: 数据生成失败")
+            return ret
+
+        print(f"\n数据文件已生成: {data_file}")
+        print(f"请先将数据导入数据库:")
+        print(f"  LOAD DATA INFILE '{os.path.abspath(data_file)}' INTO TABLE {args.database}.{args.table} ...")
+        print(f"\n确认数据已导入后，继续执行评估...")
+
+        if hasattr(args, 'auto_continue') and not args.auto_continue:
+            input("按 Enter 继续...")
+
+    # 步骤 2 & 3: 对不同模式进行测试
+    results = []
+    sql_modes = args.sql_modes if hasattr(args, 'sql_modes') and args.sql_modes else ["m2_l2_filter"]
+
+    for mode_id in sql_modes:
+        print(f"\n{'='*70}")
+        print(f"测试模式: {mode_id}")
+        print(f"{'='*70}")
+
+        # 创建 ann 参数
+        ann_args = argparse.Namespace(
+            sql_mode=mode_id if config and mode_id in config.get("sql_modes", {}) else None,
+            mode="l2_filter",  # 默认回退
+            k=args.k,
+            num_queries=min(args.num_queries, 500),
+            concurrency=1,
+            database=args.database,
+            table=args.table,
+            filter_val=None,
+            distribute_file_ids=True,
+            max_distinct_file_ids=args.distinct_file_ids,
+            config=getattr(args, 'config', None),
+            filter_mode=getattr(args, 'filter_mode', 'post'),
+        )
+
+        print(f"\n[阶段 B] 生成 ANN 文件 ({mode_id})...")
+        if config and mode_id in config.get("sql_modes", {}):
+            ret = run_ann_with_config(ann_args, config)
+        else:
+            ret = run_ann(ann_args)
+
+        if ret != 0:
+            print(f"警告: {mode_id} 模式 ANN 文件生成失败")
+            continue
+
+        # 执行评估
+        print(f"\n[阶段 C] 执行评估 ({mode_id})...")
+        eval_args = argparse.Namespace(
+            sql_mode=mode_id if config and mode_id in config.get("sql_modes", {}) else None,
+            mode="l2_filter",
+            k=args.k,
+            num_queries=args.num_queries,
+            concurrency=args.concurrency,
+            duration=None,
+            database=args.database,
+            table=args.table,
+            filter_val=None,
+            distribute_file_ids=True,
+            max_distinct_file_ids=args.distinct_file_ids,
+            skip_db_verify=False,
+            write_ann_files=False,
+            config=getattr(args, 'config', None),
+            filter_mode=getattr(args, 'filter_mode', 'post'),
+        )
+
+        if config and mode_id in config.get("sql_modes", {}):
+            ret = run_eval_with_config(eval_args, config)
+        else:
+            ret = run_eval(eval_args)
+
+        results.append((mode_id, ret))
+
+    # 汇总结果
+    print(f"\n{'='*70}")
+    print("测试完成")
+    print(f"{'='*70}")
+    for mode_id, ret in results:
+        status = "成功" if ret == 0 else "失败"
+        print(f"  {mode_id}: {status}")
+
     return 0
 
 
@@ -757,27 +863,25 @@ def run_init(args):
                 password=args.password,
                 database=args.database,
             )
-            # 构建索引参数
-            index_params_parts = [args.index_type]
-            if args.index_type == "ivf":
-                if args.ivf_lists:
-                    index_params_parts.append(f"lists={args.ivf_lists}")
-                if args.ivf_probe:
-                    index_params_parts.append(f"probe={args.ivf_probe}")
-            index_params_str = "(" + ",".join(index_params_parts[1:]) + ")" if len(index_params_parts) > 1 else ""
+            # 构建 Lindb/MatrixOne 格式的索引 SQL
+            # 格式: CREATE INDEX idx_l2 USING ivfflat ON table(embedding) lists=XXX op_type "vector_l2_ops"
+            index_name = "idx_l2"
+            index_type = args.index_type  # ivfflat
+            lists_val = args.ivf_lists if args.ivf_lists else 100  # 默认 100
+            op_type = getattr(args, 'op_type', 'vector_l2_ops')
 
-            create_index_sql = f"""
-            CREATE INDEX IF NOT EXISTS idx_embedding ON `{args.table}`(embedding)
-            USING {args.index_type}{index_params_str}
-            """
+            create_index_sql = f'''CREATE INDEX {index_name} USING {index_type} ON `{args.table}`(embedding) lists={lists_val} op_type "{op_type}"'''
+
             with conn.cursor() as cur:
                 cur.execute(create_index_sql)
-                print(f"  向量索引已创建: USING {args.index_type}{index_params_str}")
+                print(f'  向量索引已创建: {index_name} USING {index_type} lists={lists_val} op_type "{op_type}"')
             conn.commit()
             conn.close()
         except Exception as e:
             print(f"警告: 创建向量索引失败: {e}")
-            print(f"  请手动创建索引: CREATE INDEX idx_embedding ON {args.table}(embedding) USING {index_params}")
+            lists_val = args.ivf_lists if args.ivf_lists else 100
+            op_type = getattr(args, 'op_type', 'vector_l2_ops')
+            print(f'  请手动创建索引: CREATE INDEX idx_l2 USING ivfflat ON {args.table}(embedding) lists={lists_val} op_type "{op_type}"')
     else:
         print(f"\n[步骤 5] 跳过创建向量索引（使用 --create-index 启用）")
 
@@ -788,113 +892,9 @@ def run_init(args):
     # 步骤 6: 自动运行测试（如果指定）
     if args.auto_run:
         print(f"\n[步骤 6] 自动运行测试...")
+        # 标记数据已生成，跳过 run_full_test 的数据生成阶段
+        args.skip_data_gen = True
         return run_full_test(args)
-
-    return 0
-
-
-    # 加载配置
-    config = None
-    if hasattr(args, 'config') and args.config:
-        config = load_sql_config(args.config)
-    elif os.path.exists(DEFAULT_CONFIG_FILE):
-        config = load_sql_config()
-
-    # 步骤 1: 生成数据
-    print("\n[步骤 1] 生成测试数据...")
-    data_file = f"test_data_{args.rows}.csv"
-
-    gen_args = argparse.Namespace(
-        rows=args.rows,
-        output=data_file,
-        distinct_file_ids=args.distinct_file_ids,
-        seed=42,
-        with_header=False,
-        five_column=False,
-    )
-
-    ret = run_generate(gen_args)
-    if ret != 0:
-        print("错误: 数据生成失败")
-        return ret
-
-    print(f"\n数据文件已生成: {data_file}")
-    print(f"请先将数据导入数据库:")
-    print(f"  LOAD DATA INFILE '{os.path.abspath(data_file)}' INTO TABLE {args.database}.{args.table} ...")
-    print(f"\n确认数据已导入后，继续执行评估...")
-
-    if hasattr(args, 'auto_continue') and not args.auto_continue:
-        input("按 Enter 继续...")
-
-    # 步骤 2 & 3: 对不同模式进行测试
-    results = []
-    sql_modes = args.sql_modes if hasattr(args, 'sql_modes') and args.sql_modes else ["m2_prefilter"]
-
-    for mode_id in sql_modes:
-        print(f"\n{'='*70}")
-        print(f"测试模式: {mode_id}")
-        print(f"{'='*70}")
-
-        # 创建 ann 参数
-        ann_args = argparse.Namespace(
-            sql_mode=mode_id if config and mode_id in config.get("sql_modes", {}) else None,
-            mode="prefilter",  # 默认回退
-            k=args.k,
-            num_queries=min(args.num_queries, 500),
-            concurrency=1,
-            database=args.database,
-            table=args.table,
-            filter_val=None,
-            distribute_file_ids=True,
-            max_distinct_file_ids=args.distinct_file_ids,
-            config=getattr(args, 'config', None),
-            filter_mode=getattr(args, 'filter_mode', 'post'),
-        )
-
-        print(f"\n[步骤 2] 生成 ANN 文件 ({mode_id})...")
-        if config and mode_id in config.get("sql_modes", {}):
-            ret = run_ann_with_config(ann_args, config)
-        else:
-            ret = run_ann(ann_args)
-
-        if ret != 0:
-            print(f"警告: {mode_id} 模式 ANN 文件生成失败")
-            continue
-
-        # 执行评估
-        print(f"\n[步骤 3] 执行评估 ({mode_id})...")
-        eval_args = argparse.Namespace(
-            sql_mode=mode_id if config and mode_id in config.get("sql_modes", {}) else None,
-            mode="prefilter",
-            k=args.k,
-            num_queries=args.num_queries,
-            concurrency=args.concurrency,
-            duration=None,
-            database=args.database,
-            table=args.table,
-            filter_val=None,
-            distribute_file_ids=True,
-            max_distinct_file_ids=args.distinct_file_ids,
-            skip_db_verify=False,
-            write_ann_files=False,
-            config=getattr(args, 'config', None),
-            filter_mode=getattr(args, 'filter_mode', 'post'),
-        )
-
-        if config and mode_id in config.get("sql_modes", {}):
-            ret = run_eval_with_config(eval_args, config)
-        else:
-            ret = run_eval(eval_args)
-
-        results.append((mode_id, ret))
-
-    # 汇总结果
-    print(f"\n{'='*70}")
-    print("测试完成")
-    print(f"{'='*70}")
-    for mode_id, ret in results:
-        status = "成功" if ret == 0 else "失败"
-        print(f"  {mode_id}: {status}")
 
     return 0
 
@@ -967,19 +967,16 @@ filter_mode 说明（仅影响 Ground Truth SQL）:
   python run_vector_test.py init --database jst_app --table historical_file_blocks \\
     --data-file data.csv --create-db --create-table --create-index --index-type ivf
 
-  # 创建 IVF 索引（指定 lists 和 probe）
+  # 创建 IVF 索引（指定 lists 和 op_type）
   python run_vector_test.py init --database jst_app --table historical_file_blocks \\
-    --create-index --index-type ivf --ivf-lists 100 --ivf-probe 10
+    --create-index --index-type ivfflat --ivf-lists 100 --op-type vector_l2_ops
 
   # 一键完整流程：初始化 + 自动生成数据 + 测试（使用 IVF 索引）
   python run_vector_test.py init --database jst_app --table historical_file_blocks \\
     -n 100k --distinct-file-ids 50 --auto-generate --create-db --create-table \\
-    --create-index --index-type ivf --ivf-lists 200 --ivf-probe 20 \\
+    --create-index --index-type ivfflat --ivf-lists 200 \\
     --auto-run --sql-modes m1_l2_only m2_l2_filter --concurrency 4
         """,
-    )
-    )
-    )
     )
 
     # 全局参数
@@ -1204,21 +1201,21 @@ filter_mode 说明（仅影响 Ground Truth SQL）:
     )
     init_parser.add_argument(
         "--index-type",
-        choices=["ivf"],
-        default="ivf",
-        help="向量索引类型（默认: ivf）",
+        choices=["ivfflat"],
+        default="ivfflat",
+        help="向量索引类型（默认: ivfflat）",
     )
     init_parser.add_argument(
         "--ivf-lists",
         type=int,
         default=None,
-        help="IVF 索引的 lists 数量（聚类中心数），index-type=ivf 时生效",
+        help="IVF 索引的 lists 数量（聚类中心数）",
     )
     init_parser.add_argument(
-        "--ivf-probe",
-        type=int,
-        default=None,
-        help="IVF 索引的 probe 数量（搜索时探查的聚类数），index-type=ivf 时生效",
+        "--op-type",
+        type=str,
+        default="vector_l2_ops",
+        help="向量操作类型（默认: vector_l2_ops）",
     )
     init_parser.add_argument(
         "--auto-run",

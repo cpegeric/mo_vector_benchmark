@@ -71,7 +71,7 @@ python run_vector_test.py init \
   --create-index \
   --index-type ivf \
   --ivf-lists 100 \
-  --ivf-probe 10
+  --op-type vector_l2_ops
 ```
 
 #### init 参数说明
@@ -102,7 +102,7 @@ python run_vector_test.py init \
 | `--create-index` | 创建向量索引 |
 | `--index-type` | 索引类型（默认: ivf） |
 | `--ivf-lists` | IVF 聚类中心数 |
-| `--ivf-probe` | IVF 搜索探查数 |
+| `--op-type` | 向量操作类型（默认: vector_l2_ops） |
 
 **自动运行选项**
 | 参数 | 说明 |
@@ -281,10 +281,12 @@ Ground Truth 结果 vs 索引查询结果
 ### IVF 索引
 
 ```sql
-CREATE INDEX idx_embedding ON table(embedding) USING ivf(lists=100,probe=10)
+CREATE INDEX idx_l2 USING ivfflat ON table(embedding) lists=100 op_type "vector_l2_ops"
 ```
 
 - 聚类近似搜索
+- `lists`: 聚类中心数量，建议设置为数据量的平方根
+- `op_type`: 向量操作类型，支持 `vector_l2_ops` (L2距离)
 - `lists`: 聚类中心数量，通常设置为数据量的平方根
 - `probe`: 搜索时探查的聚类数，越大召回率越高
 - 适合大数据量场景，需要权衡召回率和速度
@@ -359,7 +361,7 @@ python run_vector_test.py init \
   --create-index \
   --index-type ivf \
   --ivf-lists 100 \
-  --ivf-probe 10
+  --op-type vector_l2_ops
 
 # 步骤 3: 生成 ANN 文件（用于后续快速测试）
 python run_vector_test.py ann \
