@@ -948,10 +948,6 @@ def evaluate_single_query(
     执行单个查询的 ground truth 和实际检索，返回召回率、ground truth ids、查询向量及实际检索耗时。
     每个线程使用独立的数据库连接。
     """
-    # 记录本次查询的上下文信息（仅打印一次，避免过多日志）
-    mode_name = mode_int_to_str(mode_int)
-    print(f"[query] start single query, mode={mode_name}, k={k}")
-
     conn = get_conn()
     try:
         gt = get_ground_truth_ids(

@@ -162,16 +162,16 @@ python run_vector_test.py eval \
   --sql-mode m3_l2_filter_threshold \
   -n 1000 \
   -k 10 \
-  --concurrency 4
+  --concurrency 100
 
-# 压测模式（持续 60 秒）
+# 压测模式（持续 120 秒）
 python run_vector_test.py eval \
   --sql-mode m2_l2_filter \
   --filter-mode pre \
   -n 1000 \
   -k 10 \
-  --concurrency 8 \
-  --duration 60
+  --concurrency 100 \
+  --duration 120
 ```
 
 ### `list-modes` - 列出所有 SQL 模式
