@@ -33,8 +33,8 @@ python run_vector_test.py init \
   --create-index \
   --index-type ivf \
   --auto-run \
-  --sql-modes m1_l2_only m2_l2_filter \
-  --concurrency 4
+  --sql-modes m2_l2_filter \
+  --concurrency 100
 ```
 
 ## 命令详解
@@ -52,7 +52,7 @@ python run_vector_test.py init \
   --create-db \
   --create-table \
   --create-index \
-  --index-type ivf
+  --index-type ivfflat
 
 # 自动生成数据并初始化
 python run_vector_test.py init \
@@ -69,7 +69,7 @@ python run_vector_test.py init \
   --database jst_app \
   --table historical_file_blocks \
   --create-index \
-  --index-type ivf \
+  --index-type ivfflat \
   --ivf-lists 100 \
   --op-type vector_l2_ops
 ```
@@ -120,7 +120,7 @@ python run_vector_test.py init \
 python run_vector_test.py generate -n 1m --distinct-file-ids 50
 
 # 生成 1000万行数据，指定输出文件
-python run_vector_test.py generate -n 10m --distinct-file-ids 200 -o big_data.csv
+python run_vector_test.py generate -n 10m --distinct-file-ids 50 -o big_data.csv
 ```
 
 ### `ann` - 生成 ANN 评测文件
@@ -137,7 +137,7 @@ python run_vector_test.py ann \
 # 使用 m2_l2_filter 模式，指定 filter_mode
 python run_vector_test.py ann \
   --sql-mode m2_l2_filter \
-  --filter-mode force \
+  --filter-mode post \
   -n 1000 \
   -k 10
 
@@ -167,7 +167,7 @@ python run_vector_test.py eval \
 # 压测模式（持续 60 秒）
 python run_vector_test.py eval \
   --sql-mode m2_l2_filter \
-  --filter-mode force \
+  --filter-mode pre \
   -n 1000 \
   -k 10 \
   --concurrency 8 \
@@ -184,17 +184,6 @@ python run_vector_test.py list-modes --config my_config.json
 ```
 
 ### `run` - 完整测试流程
-
-生成数据并运行多模式对比测试。
-
-```bash
-# 生成 100k 数据，测试 m1 和 m2 模式
-python run_vector_test.py run \
-  -n 100k \
-  --distinct-file-ids 50 \
-  --sql-modes m1_l2_only m2_l2_filter \
-  --concurrency 4
-```
 
 ## 配置文件说明
 
@@ -281,7 +270,7 @@ Ground Truth 结果 vs 索引查询结果
 ### IVF 索引
 
 ```sql
-CREATE INDEX idx_l2 USING ivfflat ON table(embedding) lists=100 op_type "vector_l2_ops"
+CREATE INDEX idx_l2 USING ivfflat ON table(embedding) lists=1000 op_type "vector_l2_ops"
 ```
 
 - 聚类近似搜索
@@ -348,7 +337,7 @@ IGNORE 1 LINES
 # 步骤 1: 生成 100万条测试数据
 python run_vector_test.py generate \
   -n 1m \
-  --distinct-file-ids 100 \
+  --distinct-file-ids 50 \
   -o test_data.csv
 
 # 步骤 2: 初始化环境（创建库、表、导入、建索引）
@@ -359,8 +348,8 @@ python run_vector_test.py init \
   --create-db \
   --create-table \
   --create-index \
-  --index-type ivf \
-  --ivf-lists 100 \
+  --index-type ivfflat \
+  --ivf-lists 1000 \
   --op-type vector_l2_ops
 
 # 步骤 3: 生成 ANN 文件（用于后续快速测试）
@@ -375,12 +364,12 @@ python run_vector_test.py ann \
 # 步骤 4: 运行评估
 python run_vector_test.py eval \
   --sql-mode m2_l2_filter \
-  --filter-mode force \
+  --filter-mode pre \
   --database jst_app \
   --table historical_file_blocks \
   -n 1000 \
   -k 10 \
-  --concurrency 4
+  --concurrency 100
 
 # 或者使用一键流程
 python run_vector_test.py init \
@@ -391,8 +380,8 @@ python run_vector_test.py init \
   --create-db \
   --create-table \
   --create-index \
-  --index-type ivf \
+  --index-type ivfflat \
   --auto-run \
-  --sql-modes m1_l2_only m2_l2_filter \
-  --concurrency 4
+  --sql-modes m2_l2_filter \
+  --concurrency 100
 ```
