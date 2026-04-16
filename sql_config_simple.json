@@ -11,12 +11,13 @@
     "m3_l2_filter_threshold": {
       "type": "l2_filter_threshold",
       "sql": "SELECT `file_id`, `id`, l2_distance(`{emb_col}`, %s) AS dist FROM `{table}` WHERE `{filter_col}` = %s AND l2_distance(`{emb_col}`, %s) <= {max_distance} ORDER BY dist ASC LIMIT %s",
-      "extra": { "max_distance": 1.77 }
+      "extra": { "max_distance": 2.5 }
     }
   },
   "default": {
-    "table": "historical_file_blocks",
+    "table": "historical_file_blocks_wiki",
     "emb_col": "embedding",
-    "filter_col": "file_id"
+    "filter_col": "file_id",
+    "min_verify_partition_rows": 2000
   }
 }

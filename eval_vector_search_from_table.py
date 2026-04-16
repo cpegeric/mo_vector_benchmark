@@ -1,5 +1,6 @@
 import argparse
 import hashlib
+import json
 import os
 import pickle
 import struct
@@ -22,10 +23,11 @@ DB_CONFIG = dict(
     cursorclass=pymysql.cursors.Cursor,
 )
 
-# 与 vector_query_concurrent_benchmark.py 一致：S3 的 l2 上界、默认表与列名
+# 与 vector_query_concurrent_benchmark.py 一致：S3 的 l2 上界、默认表与列名（可被 sql_config_simple.json 覆盖）
 S3_L2_DISTANCE_MAX: float = 1.77
-TABLE_S1 = "historical_file_blocks"
-TABLE_S23 = "historical_file_blocks"
+# S2/S3 预检：分区内 / S3 阈值球内行数至少为该值（可被 sql_config_simple.json 覆盖）
+MIN_VERIFY_PARTITION_ROWS: int = 2000
+TABLE_NAME = "historical_file_blocks"
 EMB_COL = "embedding"
 FILTER_COL = "file_id"
 # 主键列名（S2/S3 在 file_id 分区内可先用 RAND 抽 id 再取 embedding，减轻对向量列排序）
@@ -40,6 +42,34 @@ REQUIRE_PARTITION_ROW_COUNT_GT_K: bool = True
 S3_THRESHOLD_COVERAGE_MAX_PROBES: int = 32
 
 
+def load_sql_config_simple(config_path: Optional[str] = None) -> None:
+    """从 sql_config_simple.json 读取 max_distance（S3 阈值）、min_verify_partition_rows（预检最小行数）。"""
+    global S3_L2_DISTANCE_MAX, MIN_VERIFY_PARTITION_ROWS
+    path = config_path or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "sql_config_simple.json"
+    )
+    if not os.path.isfile(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    default = cfg.get("default") or {}
+    m = default.get("min_verify_partition_rows")
+    if m is not None:
+        MIN_VERIFY_PARTITION_ROWS = int(m)
+    modes = cfg.get("sql_modes") or {}
+    m3 = modes.get("m3_l2_filter_threshold") or {}
+    extra = m3.get("extra") or {}
+    md = extra.get("max_distance")
+    if md is not None:
+        S3_L2_DISTANCE_MAX = float(md)
+
+
+load_sql_config_simple()
+
+
 def _fq_table(simple_name: str) -> str:
     db = DB_CONFIG.get("database")
     if db:
@@ -52,8 +82,8 @@ def _init_sql_mode_templates() -> Tuple[str, str, str]:
     与 vector_query_concurrent_benchmark.run_task_sql1/sql2/sql3 相同语义；
     LIMIT 使用 %s 占位以便与现有 pymysql 参数传递一致。
     """
-    s1 = _fq_table(TABLE_S1)
-    s23 = _fq_table(TABLE_S23)
+    s1 = _fq_table(TABLE_NAME)
+    s23 = _fq_table(TABLE_NAME)
     ec = f"`{EMB_COL}`"
     fc = f"`{FILTER_COL}`"
     lim = S3_L2_DISTANCE_MAX
@@ -123,7 +153,7 @@ def row_to_eval_id(row: Tuple) -> str:
 
 def fetch_sample_filter_value(conn) -> Any:
     """mode 2/3：抽一条与 concurrent 一致的过滤列值（默认 file_id）。"""
-    s23 = _fq_table(TABLE_S23)
+    s23 = _fq_table(TABLE_NAME)
     ec = f"`{EMB_COL}`"
     fc = f"`{FILTER_COL}`"
     sql = f"SELECT {fc} FROM {s23} WHERE {ec} IS NOT NULL LIMIT 1"
@@ -132,7 +162,7 @@ def fetch_sample_filter_value(conn) -> Any:
         r = cur.fetchone()
     if not r or r[0] is None:
         raise ValueError(
-            f"无法从 {TABLE_S23} 抽样 `{FILTER_COL}`，请检查表与 `{EMB_COL}` 非空数据"
+            f"无法从 {TABLE_NAME} 抽样 `{FILTER_COL}`，请检查表与 `{EMB_COL}` 非空数据"
         )
     return r[0]
 
@@ -184,15 +214,15 @@ def sample_query_vectors(
     """
     ec = f"`{EMB_COL}`"
     if mode_int == 1:
-        t = _fq_table(TABLE_S1)
+        t = _fq_table(TABLE_NAME)
         sql = (
             f"SELECT {ec} FROM {t} WHERE {ec} IS NOT NULL "
             f"ORDER BY RAND() LIMIT %s"
         )
         params: Tuple[Any, ...] = (num_queries,)
-        tag = TABLE_S1
+        tag = TABLE_NAME
     else:
-        t = _fq_table(TABLE_S23)
+        t = _fq_table(TABLE_NAME)
         fc = f"`{FILTER_COL}`"
         pk = f"`{PK_COL}`"
         if filter_val is not None:
@@ -209,14 +239,14 @@ def sample_query_vectors(
                     f"ORDER BY RAND() LIMIT %s"
                 )
             params = (filter_val, num_queries)
-            tag = f"{TABLE_S23} WHERE {FILTER_COL}={filter_val!r} (sample via {PK_COL})"
+            tag = f"{TABLE_NAME} WHERE {FILTER_COL}={filter_val!r} (sample via {PK_COL})"
         else:
             sql = (
                 f"SELECT {ec} FROM {t} WHERE {ec} IS NOT NULL "
                 f"ORDER BY RAND() LIMIT %s"
             )
             params = (num_queries,)
-            tag = f"{TABLE_S23} (no filter)"
+            tag = f"{TABLE_NAME} (no filter)"
     with conn.cursor() as cur:
         cur.execute(sql, params)
         rows = cur.fetchall()
@@ -285,9 +315,9 @@ def multi_filter_cache_key(distinct_ids: List[Any]) -> str:
 
 def fetch_distinct_filter_values(conn, max_ids: int) -> List[Any]:
     """
-    取 TABLE_S23 上 FILTER_COL 的去重值，按值排序；max_ids<=0 表示不限制条数。
+    取 TABLE_NAME 上 FILTER_COL 的去重值，按值排序；max_ids<=0 表示不限制条数。
     """
-    t = _fq_table(TABLE_S23)
+    t = _fq_table(TABLE_NAME)
     fc = f"`{FILTER_COL}`"
     lim = f" LIMIT {int(max_ids)} " if max_ids > 0 else ""
     sql = (
@@ -458,8 +488,18 @@ def _partition_count_satisfies_topk(n: int, k: int) -> bool:
     return n >= max(k, 1)
 
 
+def _s2_s3_verify_row_count(n: int, k: int) -> bool:
+    """
+    S2/S3 预检：分区内或 S3 阈值球内行数至少 MIN_VERIFY_PARTITION_ROWS（来自 sql_config_simple.json），
+    且仍须满足 Top-K 抽样规则。
+    """
+    if n < MIN_VERIFY_PARTITION_ROWS:
+        return False
+    return _partition_count_satisfies_topk(n, k)
+
+
 def count_s1_embedding_rows(conn) -> int:
-    t = _fq_table(TABLE_S1)
+    t = _fq_table(TABLE_NAME)
     ec = f"`{EMB_COL}`"
     sql = f"SELECT COUNT(*) FROM {t} WHERE {ec} IS NOT NULL"
     with conn.cursor() as cur:
@@ -469,7 +509,7 @@ def count_s1_embedding_rows(conn) -> int:
 
 
 def count_s23_partition_rows(conn, filter_val: Any) -> int:
-    t = _fq_table(TABLE_S23)
+    t = _fq_table(TABLE_NAME)
     fc = f"`{FILTER_COL}`"
     sql = f"SELECT COUNT(*) FROM {t} WHERE {fc} = %s"
     with conn.cursor() as cur:
@@ -479,7 +519,7 @@ def count_s23_partition_rows(conn, filter_val: Any) -> int:
 
 
 def fetch_one_embedding_from_partition(conn, filter_val: Any) -> Optional[Any]:
-    t = _fq_table(TABLE_S23)
+    t = _fq_table(TABLE_NAME)
     ec, fc = f"`{EMB_COL}`", f"`{FILTER_COL}`"
     sql = f"SELECT {ec} FROM {t} WHERE {fc} = %s ORDER BY RAND() LIMIT 1"
     with conn.cursor() as cur:
@@ -493,7 +533,7 @@ def fetch_one_embedding_from_partition(conn, filter_val: Any) -> Optional[Any]:
 def count_s23_l2_within_threshold(
     conn, filter_val: Any, query_emb: Any
 ) -> int:
-    t = _fq_table(TABLE_S23)
+    t = _fq_table(TABLE_NAME)
     ec, fc = f"`{EMB_COL}`", f"`{FILTER_COL}`"
     lim = S3_L2_DISTANCE_MAX
     q = normalize_vec_param(query_emb)
@@ -515,15 +555,19 @@ def verify_matrixone_preconditions(
     num_queries: int,
 ) -> bool:
     """
-    连接当前 DB_CONFIG 的 MatrixOne，校验数据量满足「分区内 / 阈值球内行数 > k」（可配）。
+    连接当前 DB_CONFIG 的 MatrixOne，校验数据量满足预检规则。
+    S2/S3：分区内行数至少 MIN_VERIFY_PARTITION_ROWS，且满足 Top-K；S3 另校验阈值球覆盖。
     失败打印原因并返回 False。
     """
     rule = "COUNT > k" if REQUIRE_PARTITION_ROW_COUNT_GT_K else "COUNT >= k"
+    rule_s23 = (
+        f"COUNT >= {MIN_VERIFY_PARTITION_ROWS} 且 {rule}（Top-{k}）"
+    )
     if mode_int == 1:
         n = count_s1_embedding_rows(conn)
         if not _partition_count_satisfies_topk(n, k):
             print(
-                f"ERROR: S1 表 {TABLE_S1} 中带非空 `{EMB_COL}` 的行数为 {n}，"
+                f"ERROR: S1 表 {TABLE_NAME} 中带非空 `{EMB_COL}` 的行数为 {n}，"
                 f"不满足 Top-{k} 所需（{rule}）。"
             )
             return False
@@ -537,14 +581,14 @@ def verify_matrixone_preconditions(
         return False
 
     n_part = count_s23_partition_rows(conn, filter_val)
-    if not _partition_count_satisfies_topk(n_part, k):
+    if not _s2_s3_verify_row_count(n_part, k):
         print(
-            f"ERROR: {TABLE_S23} WHERE `{FILTER_COL}`={filter_val!r} 行数={n_part}，"
-            f"不满足 Top-{k}（{rule}）。请换分区或增大簇后再试。"
+            f"ERROR: {TABLE_NAME} WHERE `{FILTER_COL}`={filter_val!r} 行数={n_part}，"
+            f"不满足 {rule_s23}。请换分区或增大簇后再试。"
         )
         return False
     print(
-        f"[verify] {TABLE_S23} 分区 `{FILTER_COL}`={filter_val!r} 行数={n_part}，满足 {rule}（k={k}）。"
+        f"[verify] {TABLE_NAME} 分区 `{FILTER_COL}`={filter_val!r} 行数={n_part}，满足 {rule_s23}。"
     )
     if n_part < num_queries:
         print(
@@ -559,18 +603,18 @@ def verify_matrixone_preconditions(
             if emb is None:
                 break
             n_q = count_s23_l2_within_threshold(conn, filter_val, emb)
-            if _partition_count_satisfies_topk(n_q, k):
+            if _s2_s3_verify_row_count(n_q, k):
                 print(
                     f"[verify] S3 l2<={S3_L2_DISTANCE_MAX} 覆盖：探针 {attempt}/"
-                    f"{S3_THRESHOLD_COVERAGE_MAX_PROBES} 得到合格行数={n_q}，满足 {rule}。"
+                    f"{S3_THRESHOLD_COVERAGE_MAX_PROBES} 得到合格行数={n_q}，满足 {rule_s23}。"
                 )
                 ok_probe = True
                 break
         if not ok_probe:
             print(
                 f"ERROR: S3 在最多 {S3_THRESHOLD_COVERAGE_MAX_PROBES} 次随机探针下，"
-                f"l2_distance<={S3_L2_DISTANCE_MAX} 的行数均未满足 {rule}（k={k}）。"
-                f" 请放宽 S3_L2_DISTANCE_MAX、换 file_id 或检查向量。"
+                f"l2_distance<={S3_L2_DISTANCE_MAX} 的行数均未满足 {rule_s23}。"
+                f" 请放宽 sql_config_simple.json 中 max_distance、换 file_id 或检查向量。"
             )
             return False
 
@@ -731,7 +775,7 @@ def export_ann_files(
             "ERROR: 无法导出 ann：没有任何有效 ground truth id（id_mapping 会为空）。"
             f" 查询数={nq}，至少返回 1 行的 GT 条数={n_nonempty}。"
             "\n  常见原因（尤其 l2_filter_threshold / S3）："
-            "\n  - 当前 file_id 下没有满足 l2_distance <= 0.8 的行；"
+            f"\n  - 当前 file_id 下没有满足 l2_distance <= {S3_L2_DISTANCE_MAX} 的行；"
             "\n  - --mode23-filter 的 file_id 不对或表数据/向量异常；"
             "\n  - 精确 GT SQL（含 BY RANK WITH OPTION）执行结果为 0 行。"
             "\n  请修正数据或过滤条件后重新执行 --write-ann-files，并删除已生成的不完整文件。"
@@ -822,11 +866,12 @@ def get_index_result_ids(
     k: int,
     mode: int,
     filter_val: Optional[Any] = None,
+    filter_mode: Optional[str] = None,
 ) -> List[str]:
     """
     实际检索 SQL。
     为了评估召回率，这里与 ground truth 使用**同一种模式的 SQL 模板**，
-    唯一差别是：不追加 BY RANK WITH OPTION 'mode=force'，而是走索引/默认模式。
+    可通过 filter_mode 追加 BY RANK WITH OPTION 'mode=xxx'。
     """
     # 选择不同模式对应的 SQL 模板（与 get_ground_truth_ids 相同）
     if mode == 1:
@@ -851,8 +896,11 @@ def get_index_result_ids(
         sql_lines.append(line)
     sql_stripped = "\n".join(sql_lines).strip()
 
-    # 这里**不**追加 BY RANK WITH OPTION 'mode=force'，而是保持索引/默认模式
-    sql = sql_stripped
+    # 根据 filter_mode 追加 BY RANK WITH OPTION
+    if filter_mode:
+        sql = sql_stripped + f" BY RANK WITH OPTION 'mode={filter_mode}'"
+    else:
+        sql = sql_stripped
 
     # 统一处理向量参数
     vec_param = normalize_vec_param(vec_literal)
@@ -879,6 +927,7 @@ def evaluate_single_query_with_precomputed_gt(
     k: int,
     mode_int: int,
     filter_val: Optional[Any] = None,
+    filter_mode: Optional[str] = None,
 ) -> Tuple[float, List[str], List[str], float]:
     """
     使用预先计算好的 ground truth（从文件加载）来评估单个查询：
@@ -895,6 +944,7 @@ def evaluate_single_query_with_precomputed_gt(
             k,
             mode_int,
             filter_val=filter_val,
+            filter_mode=filter_mode,
         )
         latency = time.perf_counter() - t0
         r = recall_at_k(gt_ids, res, k)
@@ -943,6 +993,7 @@ def evaluate_single_query(
     k: int,
     mode_int: int,
     filter_val: Optional[Any] = None,
+    filter_mode: Optional[str] = None,
 ) -> Tuple[float, List[str], List[str], float]:
     """
     执行单个查询的 ground truth 和实际检索，返回召回率、ground truth ids、查询向量及实际检索耗时。
@@ -964,6 +1015,7 @@ def evaluate_single_query(
             k,
             mode_int,
             filter_val=filter_val,
+            filter_mode=filter_mode,
         )
         latency = time.perf_counter() - t0
         r = recall_at_k(gt, res, k)
@@ -977,6 +1029,7 @@ def evaluate_single_query_for_qps(
     k: int,
     mode_int: int,
     filter_val: Optional[Any] = None,
+    filter_mode: Optional[str] = None,
 ) -> float:
     """
     执行单个查询用于 QPS 测试，返回延迟（秒）。
@@ -990,6 +1043,7 @@ def evaluate_single_query_for_qps(
             k,
             mode_int,
             filter_val=filter_val,
+            filter_mode=filter_mode,
         )
         t1 = time.perf_counter()
         return t1 - t0
@@ -1006,6 +1060,7 @@ def evaluate_by_duration(
     duration: float,
     filter_val: Optional[Any] = None,
     filter_vals: Optional[List[Any]] = None,
+    filter_mode: Optional[str] = None,
 ):
     """
     在指定时间内持续运行查询，统计 QPS 和召回率。
@@ -1054,16 +1109,16 @@ def evaluate_by_duration(
                 # 执行查询并计算召回率
                 try:
                     r, gt, vec, _ = evaluate_single_query(
-                        vec_literal, k, mode_int, filter_val=fv
+                        vec_literal, k, mode_int, filter_val=fv, filter_mode=filter_mode
                     )
                     local_recalls.append(r)
                     if write_ann_files:
                         local_ann_queries.append(vec)
                         local_gt_ids.append(gt)
-                    
+
                     # 执行 QPS 测试
                     latency = evaluate_single_query_for_qps(
-                        vec_literal, k, mode_int, filter_val=fv
+                        vec_literal, k, mode_int, filter_val=fv, filter_mode=filter_mode
                     )
                     local_latencies.append(latency)
                     local_count += 1
@@ -1161,13 +1216,58 @@ def evaluate(
     skip_db_verify: bool = False,
     ann_distribute_file_ids: bool = False,
     ann_max_distinct_file_ids: int = 50,
+    probe: Optional[int] = None,
+    filter_mode: Optional[str] = None,
 ):
     if database:
         DB_CONFIG["database"] = database
+    # 每次评测前重新读取 sql_config_simple.json（阈值、预检最小行数等）
+    load_sql_config_simple()
     refresh_sql_mode_templates()
+    print(
+        f"[config] sql_config_simple.json: max_distance={S3_L2_DISTANCE_MAX}, "
+        f"min_verify_partition_rows={MIN_VERIFY_PARTITION_ROWS}"
+    )
 
-    # 将字符串模式转换为数字
+    # 连接数据库设置全局 probe_limit
+    if probe is not None:
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SET GLOBAL probe_limit = {probe}")
+                print(f"[config] SET GLOBAL probe_limit = {probe}")
+        finally:
+            conn.close()
+
+        # 新开 session 验证 probe_limit 值
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SHOW VARIABLES LIKE 'probe_limit'")
+                result = cur.fetchone()
+                if result:
+                    print(f"[config] Current probe_limit: {result[1]}")
+        finally:
+            conn.close()
+
+    # 打印 filter_mode 配置
+    if filter_mode:
+        print(f"[config] Filter mode: {filter_mode}")
+
+    # 打印示例 SQL
     mode_int = mode_str_to_int(mode)
+    if mode_int == 1:
+        example_sql = SQL_MODE_L2_ONLY
+    elif mode_int == 2:
+        example_sql = SQL_MODE_L2_FILTER
+    else:
+        example_sql = SQL_MODE_L2_FILTER_THRESHOLD
+
+    # 构造带 filter_mode 的示例 SQL
+    example_sql_clean = " ".join([ln for ln in example_sql.splitlines() if not ln.strip().startswith("--")]).strip()
+    if filter_mode:
+        example_sql_clean += f" BY RANK WITH OPTION 'mode={filter_mode}'"
+    print(f"[config] Example SQL: {example_sql_clean[:200]}...")
 
     mode23_filter: Optional[Any] = None
     if mode_int in (2, 3) and not ann_distribute_file_ids:
@@ -1189,7 +1289,9 @@ def evaluate(
     mode_names = {
         "l2_only": "S1：cosine_similarity 全表 Top-K（historical_file_blocks_cos）",
         "l2_filter": "S2：file_id 过滤 + L2 Top-K（historical_file_blocks）",
-        "l2_filter_threshold": "S3：file_id + L2<=0.8 + Top-K（historical_file_blocks）",
+        "l2_filter_threshold": (
+            f"S3：file_id + L2<={S3_L2_DISTANCE_MAX} + Top-K（historical_file_blocks）"
+        ),
     }
     if duration:
         print(
@@ -1399,6 +1501,7 @@ def evaluate(
                     k,
                     mode_int,
                     filter_val=q_filters[i],
+                    filter_mode=filter_mode,
                 )
                 recalls.append(r)
                 latencies.append(latency)
@@ -1493,6 +1596,7 @@ def evaluate(
                             k,
                             mode_int,
                             q_filters[i],
+                            filter_mode,
                         ): i
                         for i in range(len(query_vecs))
                     }
@@ -1588,7 +1692,13 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="l2_only",
         choices=["l2_only", "l2_filter", "l2_filter_threshold"],
-        help="l2_only=S1 cosine Top-K；l2_filter=S2 file_id+L2；l2_filter_threshold=S3 同上且 l2<=0.8",
+        help="l2_only=S1 cosine Top-K；l2_filter=S2 file_id+L2；l2_filter_threshold=S3 同上且 l2 距离阈值见 sql_config_simple.json",
+    )
+    parser.add_argument(
+        "--table",
+        type=str,
+        default=None,
+        help="指定表名（覆盖默认的 historical_file_blocks）",
     )
     parser.add_argument("--k", type=int, default=K, help="Top-K size")
     parser.add_argument(
@@ -1678,11 +1788,29 @@ def parse_args() -> argparse.Namespace:
         help="与 --query-fvecs 配套：每行一个 file_id，与 query 顺序一一对应；"
         "不设则若存在同名 .filters.txt 会自动加载",
     )
+    parser.add_argument(
+        "--probe",
+        type=int,
+        default=None,
+        help="设置 probe_limit 值（用于 IVF 索引查询）",
+    )
+    parser.add_argument(
+        "--filter-mode",
+        type=str,
+        default=None,
+        choices=["pre", "post", "force"],
+        help="SQL 后缀模式：pre（预过滤）、post（后过滤）、force（强制精确搜索）",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
+    # 如果指定了表名，更新全局表名变量
+    if args.table:
+        TABLE_NAME = args.table
+        # 刷新 SQL 模板
+        refresh_sql_mode_templates()
     evaluate(
         num_queries=args.num_queries,
         k=args.k,
@@ -1700,5 +1828,7 @@ if __name__ == "__main__":
         skip_db_verify=args.skip_db_verify,
         ann_distribute_file_ids=args.ann_distribute_file_ids,
         ann_max_distinct_file_ids=args.ann_max_distinct_file_ids,
+        probe=args.probe,
+        filter_mode=args.filter_mode,
     )
 

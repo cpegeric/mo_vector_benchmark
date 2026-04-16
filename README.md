@@ -1,15 +1,50 @@
-# 向量搜索测试工具
+# Wiki-all 向量数据集测试工具
 
-一套用于测试向量数据库（MatrixOne）搜索性能的工具集，支持数据生成、环境初始化、ANN 文件生成和召回率/QPS 评估。
+用于 cuVS Bench Wiki-all 数据集（768 维向量）导入和测试 MatrixOne 向量搜索性能的工具。
 
-## 组件说明
+## 测试场景说明
 
-| 文件 | 说明 |
+### SQL 查询场景
+
+工具支持三种 SQL 查询场景，适用于不同的向量搜索需求：
+
+| 场景 | 说明 | 适用条件 |
+|------|------|----------|
+| **l2_only** | 全表向量相似度搜索，不带过滤条件 | 适用于对整个数据集进行相似度检索 |
+| **l2_filter** | 先按 file_id 过滤，再在同 file_id 分区内进行向量搜索 | 适用于多租户场景，按 file_id 隔离数据 |
+| **l2_filter_threshold** | 在 l2_filter 基础上增加距离阈值，只返回距离小于阈值的向量 | 适用于需要过滤远距离结果的精确检索 |
+
+### Filter 模式
+
+针对三种 SQL 场景支持三种不同的filter模式：
+
+| 模式 | 说明 | 适用场景 |
+|------|------|----------|
+| **pre** | 预过滤模式 | 索引层先过滤再计算距离，减少向量计算量，性能优先 |
+| **post** | 后过滤模式（默认） | 向量计算后过滤，保证精度 |
+| **force** | 强制精确搜索 | 不使用索引，全表精确计算，作为召回率 baseline |
+
+### 评估指标
+
+| 指标 | 说明 |
 |------|------|
-| `generate_historical_file_blocks.py` | 生成测试数据 CSV |
-| `eval_vector_search_from_table.py` | 向量搜索召回率和 QPS 评估 |
-| `run_vector_test.py` | 统一入口脚本，支持配置化 SQL 模式 |
-| `sql_config_simple.json` | SQL 模式配置文件 |
+| **Recall** | 召回率，索引搜索结果与精确搜索结果的匹配度 |
+| **QPS** | 每秒查询次数，反映系统吞吐量 |
+| **Latency** | 查询延迟（P50/P99），反映响应速度 |
+
+### 配置文件 `sql_config_simple.json`
+
+与 `eval_vector_search_from_table.py` 同目录，**标准 JSON（不支持 `//` 或 `#` 注释）**。每次执行 `ann` / `run` / `wiki test` 等会由评测脚本读取，用于生成 SQL 模板、S3 距离阈值与预检行数。
+
+| 区块 | 字段 | 说明 |
+|------|------|------|
+| `sql_modes` | `m1_l2_only` / `m2_l2_filter` / `m3_l2_filter_threshold` | 对应 `l2_only`、`l2_filter`、`l2_filter_threshold` 三类查询；`sql` 中含占位符 `{table}`、`{emb_col}`、`{filter_col}`、`{max_distance}`（仅 m3）等，由程序替换为实际库表与列名。 |
+| `sql_modes.m3_l2_filter_threshold.extra` | `max_distance` | **S3（l2_filter_threshold）** 的 L2 距离上界，写入 SQL 与预检逻辑。可按数据规模调整，例如约 100 万行量级可试 **2.5**，约 1000 万行量级可试 **2.9**（需自行按召回与数据分布调参）。 |
+| `default` | `table` | 文档/默认表名参考；实际表名以命令行全局参数 `--table` 为准。 |
+| `default` | `emb_col` / `filter_col` | 向量列、过滤列名，与表结构一致即可。 |
+| `default` | `min_verify_partition_rows` | 跑评测前校验：每个 `file_id` 分区内行数、以及 S3 阈值球内行数，至少达到该值才认为通过预检（默认 **2000**）。 |
+
+修改 `sql_config_simple.json` 后无需改代码；若评测进程未重启，下一次调用 `evaluate` 时会重新加载该文件。
 
 ## 快速开始
 
@@ -19,369 +54,266 @@
 pip install numpy pymysql
 ```
 
-### 2. 一键完整测试流程
+### 2. 下载 Wiki-all 数据集
+
+使用 [cuVS Bench Wiki-all 数据集](https://docs.rapids.ai/api/cuvs/nightly/cuvs_bench/wiki_all_dataset/) 进行测试（真实数据，768 维向量）。
 
 ```bash
-# 自动生成数据、创建表、导入数据、建索引、运行测试
-python run_vector_test.py init \
-  --database jst_app \
-  --table historical_file_blocks \
-  --auto-generate -n 100k \
-  --distinct-file-ids 50 \
-  --create-db \
-  --create-table \
-  --create-index \
-  --index-type ivf \
-  --auto-run \
-  --sql-modes m2_l2_filter \
-  --concurrency 100
+# 下载 Wiki-all 数据集 1M（约 100 万条，2.9GB）
+curl -L -O https://data.rapids.ai/raft/datasets/wiki_all_1M/wiki_all_1M.tar
+
+# 下载 Wiki-all 数据集 10M（约 1000 万条）
+curl -L -O https://data.rapids.ai/raft/datasets/wiki_all_10M/wiki_all_10M.tar
+
+# 解压 tar 文件（以 1M 为例）
+tar -xf wiki_all_1M.tar
+
+# 下载 Wiki-all 数据集 88M（完整数据集，分卷下载）
+curl -s https://data.rapids.ai/raft/datasets/wiki_all/wiki_all.tar.{00..9} | tar -xf - -C wiki_all_88M/
+
+# 解压 tar 文件
+cat wiki_all.tar.* | tar -xf - -C wiki_all_88M/
 ```
+
+### 3. 初始化测试环境数据 wiki_all
+
+使用 `wiki setup` 命令一键完成：创建表 → 导入数据 → 创建索引。
+
+```bash
+# 基本用法（只需指定 --fbin 以 1M 为例）
+python run_vector_test.py wiki setup --fbin wiki_all_1M/base.fbin
+```
+
+**`wiki setup` 参数说明**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--fbin` | - | **必需**。`.fbin` 向量文件路径，指定后自动执行创建表、导入、建索引三步 |
+| `--ivf-lists` | 1000 | IVF 聚类中心数。数据量越大，建议值越大（如 100 万数据建议 1000） |
+| `--batch-size` | 20000 | 批量导入大小。导入时的批处理行数 |
+| `--file-id-base` | 20000000 | file_id 起始值。导入的数据会使用 50 个不同的 file_id 循环分布 |
+
+使用例子：
+
+```bash
+# 指定 IVF lists 数量（默认 1000）
+python run_vector_test.py wiki setup --fbin wiki_all_1M/base.fbin --ivf-lists 2000
+
+# 指定数据库连接信息和表名
+python run_vector_test.py --host 192.168.1.100 --database mydb wiki setup \
+  --fbin wiki_all_1M/base.fbin \
+  --ivf-lists 2000
+```
+
+**注意**：`--fbin` 参数只需指定一次，工具会自动完成创建表、导入数据、创建索引三个步骤。如果只需要执行其中某一步，可使用 `--create-table` 或 `--create-index` 参数。
+**注意**：wiki setup 导入wiki_all采用批量加载方式，时间相对较长，如果想要快速加载数据，也可以手动用load data s3的方式加载更快,联系我获取csv s3 path
+
+表结构：
+
+```sql
+CREATE TABLE `historical_file_blocks_wiki` (
+  `id` bigint NOT NULL AUTO_INCREMENT COMMENT '主键',
+  `file_id` bigint NOT NULL,
+  `content` text DEFAULT NULL,
+  `embedding` vecf32(768) DEFAULT NULL,
+  `page_num` int NOT NULL DEFAULT 0,
+  `meta` json DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `idx_file` (`file_id`),
+  FULLTEXT `idx_content`(`content`) WITH PARSER ngram
+);
+```
+
+### 4. 生成 ANN 评测文件
+
+生成 `query.fvecs` 和 `groundtruth.ivecs` 文件，用于后续评估。
+
+```bash
+# 生成全表搜索模式的 ANN 文件
+python run_vector_test.py ann --sql-mode l2_only -n 1000 -k 10 --distribute-file-ids
+
+# 生成预过滤模式的 ANN 文件
+python run_vector_test.py ann \
+  --sql-mode l2_filter \
+  --distribute-file-ids \
+  -n 1000 -k 10
+
+# 生成距离阈值过滤模式的 ANN 文件
+python run_vector_test.py ann --sql-mode l2_filter_threshold --distribute-file-ids -n 1000 -k 10
+```
+
+**参数说明**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--sql-mode` | l2_only | SQL 模式：`l2_only`、`l2_filter`、`l2_filter_threshold` |
+| `-n, --num-queries` | 1000 | 查询数量 |
+| `-k` | 10 | Top-K |
+| `--concurrency` | 1 | 并发数 |
+| `--filter-val` | - | file_id 过滤值（用于 l2_filter 模式） |
+| `--distribute-file-ids` | - | 将查询分布到多个不同的 file_id |
+| `--max-distinct-file-ids` | 50 | 最多使用多少个不同的 file_id |
+
+**注意**：生成ann文件是暴力搜索生成的预期结果，-n 1000值越大生成文件越慢，可以调节变小缩短生成时间，适用于快速验证测试  
 
 ## 命令详解
 
-### `init` - 初始化环境
+### 全局参数
 
-创建数据库、创建表、导入数据、创建向量索引。
-
-```bash
-# 从 CSV 文件初始化
-python run_vector_test.py init \
-  --database jst_app \
-  --table historical_file_blocks \
-  --data-file data.csv \
-  --create-db \
-  --create-table \
-  --create-index \
-  --index-type ivfflat
-
-# 自动生成数据并初始化
-python run_vector_test.py init \
-  --database jst_app \
-  --table historical_file_blocks \
-  --auto-generate -n 1m \
-  --distinct-file-ids 100 \
-  --create-db \
-  --create-table \
-  --create-index
-
-# 创建 IVF 索引（指定 lists 和 probe）
-python run_vector_test.py init \
-  --database jst_app \
-  --table historical_file_blocks \
-  --create-index \
-  --index-type ivfflat \
-  --ivf-lists 100 \
-  --op-type vector_l2_ops
-```
-
-#### init 参数说明
-
-**数据库配置**
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--host` | 127.0.0.1 | 数据库主机 |
 | `--port` | 6001 | 端口 |
 | `--user` | dump | 用户名 |
 | `--password` | 111 | 密码 |
-| `--database` | jst_app | 数据库名 |
-| `--table` | historical_file_blocks | 表名 |
+| `--database` | jst_app_wiki | 数据库名 |
+| `--table` | historical_file_blocks_wiki | 表名 |
 
-**数据选项**
-| 参数 | 说明 |
-|------|------|
-| `--data-file` | 指定已有 CSV 数据文件 |
-| `--auto-generate` | 自动生成数据 |
-| `-n, --rows` | 生成行数（如 100k, 1m, 10m） |
-| `--distinct-file-ids` | 不同的 file_id 数量 |
 
-**初始化选项**
-| 参数 | 说明 |
-|------|------|
-| `--create-db` | 创建数据库 |
-| `--create-table` | 创建表 |
-| `--create-index` | 创建向量索引 |
-| `--index-type` | 索引类型（默认: ivf） |
-| `--ivf-lists` | IVF 聚类中心数 |
-| `--op-type` | 向量操作类型（默认: vector_l2_ops） |
+**参数说明**
 
-**自动运行选项**
-| 参数 | 说明 |
-|------|------|
-| `--auto-run` | 初始化完成后自动运行测试 |
-| `--sql-modes` | 自动运行时的 SQL 模式 |
-| `--num-queries` | 查询数量 |
-| `-k` | Top-K |
-| `--concurrency` | 并发数 |
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `-n, --num-queries` | 1000 | 查询数量 |
+| `-k` | 10 | Top-K |
+| `--concurrency` | 4 | 并发数 |
+| `--sql-mode` | l2_only | SQL 模式：`l2_only`（全表搜索）、`l2_filter`（预过滤）、`l2_filter_threshold`（带距离阈值） |
+| `--filter-val` | - | file_id 过滤值（用于 l2_filter 和 l2_filter_threshold 模式） |
 
-### `generate` - 生成测试数据
+**使用示例：**
 
 ```bash
-# 生成 100万行数据，50 个不同 file_id
-python run_vector_test.py generate -n 1m --distinct-file-ids 50
+# 全表搜索（默认 l2_only）
+python run_vector_test.py wiki test -n 1000 -k 10 --concurrency 100
 
-# 生成 1000万行数据，指定输出文件
-python run_vector_test.py generate -n 10m --distinct-file-ids 50 -o big_data.csv
+# 预过滤模式（指定 file_id）
+python run_vector_test.py wiki test \
+  --sql-mode l2_filter \
+  --filter-val 20000000 \
+  -n 1000 -k 10 --concurrency 100
+```
+
+### `wiki info` - 显示数据集信息
+
+```bash
+python run_vector_test.py wiki info
 ```
 
 ### `ann` - 生成 ANN 评测文件
 
-根据 SQL 模式生成 `query.fvecs` 和 `groundtruth.ivecs` 文件。
+生成 `query.fvecs` 和 `groundtruth.ivecs` 文件，用于后续评估。
 
 ```bash
-# 使用配置文件的 m1_l2_only 模式
-python run_vector_test.py ann \
-  --sql-mode m1_l2_only \
-  -n 1000 \
-  -k 10
+# 生成全表搜索模式的 ANN 文件
+python run_vector_test.py ann --sql-mode l2_only -n 1000 -k 10
 
-# 使用 m2_l2_filter 模式，指定 filter_mode
+# 生成预过滤模式的 ANN 文件（分布到多个 file_id）
 python run_vector_test.py ann \
-  --sql-mode m2_l2_filter \
-  --filter-mode post \
-  -n 1000 \
-  -k 10
-
-# 指定数据库连接
-python run_vector_test.py ann \
-  --sql-mode m2_l2_filter \
-  --host 192.168.1.100 \
-  --port 6001 \
-  --user admin \
-  --password secret \
-  --database mydb \
-  --table my_vectors \
-  -n 1000 \
-  -k 10
+  --sql-mode l2_filter \
+  --distribute-file-ids \
+  --max-distinct-file-ids 50 \
+  -n 1000 -k 10
 ```
 
-### `eval` - 运行召回率/QPS 评估
+**参数说明**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--sql-mode` | l2_only | SQL 模式：`l2_only`、`l2_filter`、`l2_filter_threshold` |
+| `-n, --num-queries` | 1000 | 查询数量 |
+| `-k` | 10 | Top-K |
+| `--concurrency` | 1 | 并发数 |
+| `--filter-val` | - | file_id 过滤值（用于 l2_filter 模式） |
+| `--distribute-file-ids` | - | 将查询分布到多个不同的 file_id |
+| `--max-distinct-file-ids` | 50 | 最多使用多少个不同的 file_id |
+
+### `run` - 运行召回率/QPS 评估
+
+运行向量搜索性能评估，输出召回率和 QPS。支持三种 SQL 场景和多种 Filter 模式，可全面评估向量索引在不同配置下的性能表现。
 
 ```bash
-# 使用 m3_l2_filter_threshold 模式评估
-python run_vector_test.py eval \
-  --sql-mode m3_l2_filter_threshold \
-  -n 1000 \
-  -k 10 \
-  --concurrency 100
+# 全表搜索评估（l2_only 场景）
+python run_vector_test.py run --sql-mode l2_only -n 1000 -k 10 --concurrency 100
 
-# 压测模式（持续 120 秒）
-python run_vector_test.py eval \
-  --sql-mode m2_l2_filter \
-  --filter-mode pre \
-  -n 1000 \
-  -k 10 \
-  --concurrency 100 \
+# 预过滤模式评估（l2_filter 场景）
+python run_vector_test.py run \
+  --sql-mode l2_filter \
+  --filter-val 20000000 \
+  -n 1000 -k 10 --concurrency 100
+
+# 多 file_id 分布测试（适合多租户场景）
+python run_vector_test.py run \
+  --sql-mode l2_filter \
+  --distribute-file-ids \
+  --max-distinct-file-ids 50 \
+  -n 1000 -k 10 --concurrency 100
+
+# 压测模式（持续 120 秒，输出 QPS 和延迟分布）
+python run_vector_test.py run \
+  --sql-mode l2_only \
+  -n 1000 -k 10 --concurrency 100 \
   --duration 120
+
+# 调整 IVF 索引 probe 参数测试召回率
+python run_vector_test.py run \
+  --sql-mode l2_filter \
+  --filter-val 20000000 \
+  -n 1000 -k 10 --concurrency 100 \
+  --probe 20
+
+# pre 模式测试（预过滤，性能优先）
+python run_vector_test.py run \
+  --sql-mode l2_filter \
+  --filter-val 20000000 \
+  -n 1000 -k 10 --concurrency 100 \
+  --filter-mode pre
+
+# force 模式测试（精确搜索，作为 baseline）
+python run_vector_test.py run \
+  --sql-mode l2_filter \
+  --filter-val 20000000 \
+  -n 1000 -k 10 --concurrency 100 \
+  --filter-mode force
 ```
 
-### `list-modes` - 列出所有 SQL 模式
+**参数说明**
 
-```bash
-python run_vector_test.py list-modes
-
-# 使用自定义配置文件
-python run_vector_test.py list-modes --config my_config.json
-```
-
-### `run` - 完整测试流程
-
-## 配置文件说明
-
-### `sql_config_simple.json` 格式
-
-```json
-{
-  "sql_modes": {
-    "m1_l2_only": {
-      "type": "l2_only",
-      "sql": "SELECT `file_id`, `id` FROM `{table}` ORDER BY l2_distance(`{emb_col}`, %s) ASC LIMIT %s"
-    },
-    "m2_l2_filter": {
-      "type": "l2_filter",
-      "sql": "SELECT `file_id`, `id`, l2_distance(`{emb_col}`, %s) AS dist FROM `{table}` WHERE `{filter_col}` = %s ORDER BY dist ASC LIMIT %s"
-    },
-    "m3_l2_filter_threshold": {
-      "type": "l2_filter_threshold",
-      "sql": "SELECT `file_id`, `id`, l2_distance(`{emb_col}`, %s) AS dist FROM `{table}` WHERE `{filter_col}` = %s AND l2_distance(`{emb_col}`, %s) <= {max_distance} ORDER BY dist ASC LIMIT %s",
-      "extra": { "max_distance": 1.77 }
-    }
-  },
-  "default": {
-    "table": "historical_file_blocks",
-    "emb_col": "embedding",
-    "filter_col": "file_id"
-  }
-}
-```
-
-### 字段说明
-
-| 字段 | 说明 |
-|------|------|
-| `type` | SQL 模式类型，决定数据抽样方式：<br>- `l2_only`: 全表搜索，不需要 file_id<br>- `l2_filter`: 预过滤后搜索，需要 file_id<br>- `l2_filter_threshold`: 带距离阈值的预过滤，需要 file_id |
-| `sql` | SQL 模板，占位符说明：<br>- `{table}`: 表名<br>- `{emb_col}`: 向量列名<br>- `{filter_col}`: 过滤列名<br>- `%s`: 参数占位符（query_vec, filter_val, k）<br>- `{max_distance}`: 距离阈值（从 extra 读取） |
-| `extra` | 额外参数，可在 SQL 模板中使用 `{key}` 引用 |
-| `default` | 默认表/列名配置 |
-
-### filter_mode 说明
-
-在 `ann` 和 `eval` 命令中通过 `--filter-mode` 指定 Ground Truth SQL 的后缀：
-
-| filter_mode | SQL 后缀 | 说明 |
-|------------|----------|------|
-| `force` | `BY RANK WITH OPTION 'mode=force'` | 强制精确模式（默认） |
-| `pre` | `BY RANK WITH OPTION 'mode=pre'` | 预过滤模式 |
-| `post` | 无后缀 | 后过滤模式 |
-
-## SQL 执行流程
-
-### Ground Truth 查询（用于计算召回率）
-
-```
-基础 SQL（来自配置文件）
-    ↓
-添加 filter_mode 后缀
-    ↓
-生成 Ground Truth 结果
-```
-
-### 索引查询（用于计算 QPS）
-
-```
-基础 SQL（来自配置文件，无后缀）
-    ↓
-执行索引查询
-    ↓
-生成搜索结果
-```
-
-### 召回率计算
-
-```
-Ground Truth 结果 vs 索引查询结果
-    ↓
-计算 Recall@K = |GT ∩ Result| / K
-```
-
-## 向量索引说明
-
-本工具使用 IVF（Inverted File）索引进行向量近似搜索。IVF 索引通过聚类将向量空间划分为多个区域，搜索时只需探查部分聚类，大幅提升搜索速度。
-
-### IVF 索引
-
-```sql
-CREATE INDEX idx_l2 USING ivfflat ON table(embedding) lists=1000 op_type "vector_l2_ops"
-```
-
-- 聚类近似搜索
-- `lists`: 聚类中心数量，建议设置为数据量的平方根
-- `op_type`: 向量操作类型，支持 `vector_l2_ops` (L2距离)
-- `lists`: 聚类中心数量，通常设置为数据量的平方根
-- `probe`: 搜索时探查的聚类数，越大召回率越高
-- 适合大数据量场景，需要权衡召回率和速度
-
-## 数据生成说明
-
-生成的 CSV 格式（6 列）：
-
-```csv
-\N,20000000,"content text...","[-0.028884888,0.03186035,...]",1,"{\"seq\":1,...}"
-\N,20000001,"content text...","[0.0064964294,...]",2,"{\"seq\":2,...}"
-```
-
-| 列 | 说明 |
-|---|------|
-| id | \N（自增） |
-| file_id | 过滤 ID（默认 20000000 起始） |
-| content | 文本内容 |
-| embedding | 1024 维向量（VEC32） |
-| page_num | 页码 |
-| meta | JSON 元数据 |
-
-## 常见问题
-
-### 1. 数据导入失败
-
-MatrixOne 可能需要特定格式：
-
-```bash
-# 手动导入（调整字段分隔符和引号）
-mysql -h127.0.0.1 -P6001 -udump -p111 -e "
-LOAD DATA INFILE '/path/to/data.csv'
-INTO TABLE jst_app.historical_file_blocks
-FIELDS TERMINATED BY ','
-OPTIONALLY ENCLOSED BY '\"'
-LINES TERMINATED BY '\n'
-IGNORE 1 LINES
-(id, file_id, content, embedding, page_num, meta)
-"
-```
-
-### 2. 召回率过低
-
-- 检查索引类型和参数（IVF 的 lists/probe 设置）
-- 检查 `filter_mode` 设置是否合理
-- 确认 Ground Truth 使用的是精确模式（force）
-
-### 3. 并发测试报错
-
-- 检查数据库连接数限制
-- 适当降低 `--concurrency` 值
-- 确认网络连接稳定
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--sql-mode` | l2_only | SQL 场景：`l2_only`（全表搜索）、`l2_filter`（预过滤）、`l2_filter_threshold`（带距离阈值） |
+| `--filter-mode` | - | Filter 模式：`pre`（预过滤）、`post`（后过滤）、`force`（强制精确搜索） |
+| `-n, --num-queries` | 1000 | 查询数量 |
+| `-k` | 10 | Top-K |
+| `--concurrency` | 1 | 并发数 |
+| `--filter-val` | - | file_id 过滤值（用于 l2_filter 场景） |
+| `--duration` | - | 压测持续时间（秒） |
+| `--probe` | - | IVF 索引 probe 参数，控制查询时扫描的聚类数 |
+| `--distribute-file-ids` | - | 将查询分布到多个不同的 file_id |
+| `--max-distinct-file-ids` | 50 | 最多使用多少个不同的 file_id |
+| `--skip-db-verify` | - | 跳过数据库预检 |
 
 ## 完整示例
 
 ```bash
 #!/bin/bash
 
-# 步骤 1: 生成 100万条测试数据
-python run_vector_test.py generate \
-  -n 1m \
-  --distinct-file-ids 50 \
-  -o test_data.csv
+# 下载数据集（以 1M 为例）
+curl -L -O https://data.rapids.ai/raft/datasets/wiki_all_1M/wiki_all_1M.tar
+tar -xf wiki_all_1M.tar
 
-# 步骤 2: 初始化环境（创建库、表、导入、建索引）
-python run_vector_test.py init \
-  --database jst_app \
-  --table historical_file_blocks \
-  --data-file test_data.csv \
-  --create-db \
-  --create-table \
-  --create-index \
-  --index-type ivfflat \
-  --ivf-lists 1000 \
-  --op-type vector_l2_ops
-
-# 步骤 3: 生成 ANN 文件（用于后续快速测试）
-python run_vector_test.py ann \
-  --sql-mode m2_l2_filter \
-  --filter-mode force \
-  --database jst_app \
-  --table historical_file_blocks \
-  -n 1000 \
-  -k 10
-
-# 步骤 4: 运行评估
-python run_vector_test.py eval \
-  --sql-mode m2_l2_filter \
-  --filter-mode pre \
-  --database jst_app \
-  --table historical_file_blocks \
+# 一键完成所有步骤（创建表、导入、建索引、测试）
+python run_vector_test.py \
+  --host 127.0.0.1 \
+  --port 6001 \
+  --user dump \
+  --password 111 \
+  --database jst_app_wiki \
+  --table historical_file_blocks_wiki \
+  wiki setup \
+  --fbin wiki_all_1M/base.fbin \
+  --ivf-lists 100 \
+  --auto-test \
   -n 1000 \
   -k 10 \
-  --concurrency 100
-
-# 或者使用一键流程
-python run_vector_test.py init \
-  --database jst_app \
-  --table historical_file_blocks \
-  --auto-generate -n 100k \
-  --distinct-file-ids 50 \
-  --create-db \
-  --create-table \
-  --create-index \
-  --index-type ivfflat \
-  --auto-run \
-  --sql-modes m2_l2_filter \
-  --concurrency 100
+  --concurrency 4
 ```
