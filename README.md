@@ -39,7 +39,7 @@
 | 区块 | 字段 | 说明 |
 |------|------|------|
 | `sql_modes` | `m1_l2_only` / `m2_l2_filter` / `m3_l2_filter_threshold` | 对应 `l2_only`、`l2_filter`、`l2_filter_threshold` 三类查询；`sql` 中含占位符 `{table}`、`{emb_col}`、`{filter_col}`、`{max_distance}`（仅 m3）等，由程序替换为实际库表与列名。 |
-| `sql_modes.m3_l2_filter_threshold.extra` | `max_distance` | **S3（l2_filter_threshold）** 的 L2 距离上界，写入 SQL 与预检逻辑。可按数据规模调整，例如约 100 万行量级可试 **2.5**，约 1000 万行量级可试 **2.9**（需自行按召回与数据分布调参）。 |
+| `sql_modes.m3_l2_filter_threshold.extra` | `max_distance` | **S3（l2_filter_threshold）** 的 L2 距离上界，写入 SQL 与预检逻辑。可按数据规模调整，推荐100 万行量级可试 **2.5**，约 1000 万行量级可试 **2.9**（需自行按召回与数据分布调参）。 |
 | `default` | `table` | 文档/默认表名参考；实际表名以命令行全局参数 `--table` 为准。 |
 | `default` | `emb_col` / `filter_col` | 向量列、过滤列名，与表结构一致即可。 |
 | `default` | `min_verify_partition_rows` | 跑评测前校验：每个 `file_id` 分区内行数、以及 S3 阈值球内行数，至少达到该值才认为通过预检（默认 **2000**）。 |
@@ -123,6 +123,16 @@ CREATE TABLE `historical_file_blocks_wiki` (
   FULLTEXT `idx_content`(`content`) WITH PARSER ngram
 );
 ```
+### 全局参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--host` | 127.0.0.1 | 数据库主机 |
+| `--port` | 6001 | 端口 |
+| `--user` | dump | 用户名 |
+| `--password` | 111 | 密码 |
+| `--database` | jst_app_wiki | 数据库名 |
+| `--table` | historical_file_blocks_wiki | 表名 |
 
 ### 4. 生成 ANN 评测文件
 
@@ -156,78 +166,8 @@ python run_vector_test.py ann --sql-mode l2_filter_threshold --distribute-file-i
 
 **注意**：生成ann文件是暴力搜索生成的预期结果，-n 1000值越大生成文件越慢，可以调节变小缩短生成时间，适用于快速验证测试  
 
-## 命令详解
 
-### 全局参数
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--host` | 127.0.0.1 | 数据库主机 |
-| `--port` | 6001 | 端口 |
-| `--user` | dump | 用户名 |
-| `--password` | 111 | 密码 |
-| `--database` | jst_app_wiki | 数据库名 |
-| `--table` | historical_file_blocks_wiki | 表名 |
-
-
-**参数说明**
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `-n, --num-queries` | 1000 | 查询数量 |
-| `-k` | 10 | Top-K |
-| `--concurrency` | 4 | 并发数 |
-| `--sql-mode` | l2_only | SQL 模式：`l2_only`（全表搜索）、`l2_filter`（预过滤）、`l2_filter_threshold`（带距离阈值） |
-| `--filter-val` | - | file_id 过滤值（用于 l2_filter 和 l2_filter_threshold 模式） |
-
-**使用示例：**
-
-```bash
-# 全表搜索（默认 l2_only）
-python run_vector_test.py wiki test -n 1000 -k 10 --concurrency 100
-
-# 预过滤模式（指定 file_id）
-python run_vector_test.py wiki test \
-  --sql-mode l2_filter \
-  --filter-val 20000000 \
-  -n 1000 -k 10 --concurrency 100
-```
-
-### `wiki info` - 显示数据集信息
-
-```bash
-python run_vector_test.py wiki info
-```
-
-### `ann` - 生成 ANN 评测文件
-
-生成 `query.fvecs` 和 `groundtruth.ivecs` 文件，用于后续评估。
-
-```bash
-# 生成全表搜索模式的 ANN 文件
-python run_vector_test.py ann --sql-mode l2_only -n 1000 -k 10
-
-# 生成预过滤模式的 ANN 文件（分布到多个 file_id）
-python run_vector_test.py ann \
-  --sql-mode l2_filter \
-  --distribute-file-ids \
-  --max-distinct-file-ids 50 \
-  -n 1000 -k 10
-```
-
-**参数说明**
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--sql-mode` | l2_only | SQL 模式：`l2_only`、`l2_filter`、`l2_filter_threshold` |
-| `-n, --num-queries` | 1000 | 查询数量 |
-| `-k` | 10 | Top-K |
-| `--concurrency` | 1 | 并发数 |
-| `--filter-val` | - | file_id 过滤值（用于 l2_filter 模式） |
-| `--distribute-file-ids` | - | 将查询分布到多个不同的 file_id |
-| `--max-distinct-file-ids` | 50 | 最多使用多少个不同的 file_id |
-
-### `run` - 运行召回率/QPS 评估
+### 5. 运行召回率/QPS 评估
 
 运行向量搜索性能评估，输出召回率和 QPS。支持三种 SQL 场景和多种 Filter 模式，可全面评估向量索引在不同配置下的性能表现。
 
@@ -241,37 +181,21 @@ python run_vector_test.py run \
   --filter-val 20000000 \
   -n 1000 -k 10 --concurrency 100
 
-# 多 file_id 分布测试（适合多租户场景）
-python run_vector_test.py run \
-  --sql-mode l2_filter \
-  --distribute-file-ids \
-  --max-distinct-file-ids 50 \
-  -n 1000 -k 10 --concurrency 100
-
-# 压测模式（持续 120 秒，输出 QPS 和延迟分布）
-python run_vector_test.py run \
-  --sql-mode l2_only \
-  -n 1000 -k 10 --concurrency 100 \
-  --duration 120
-
 # 调整 IVF 索引 probe 参数测试召回率
 python run_vector_test.py run \
   --sql-mode l2_filter \
-  --filter-val 20000000 \
   -n 1000 -k 10 --concurrency 100 \
   --probe 20
 
 # pre 模式测试（预过滤，性能优先）
 python run_vector_test.py run \
   --sql-mode l2_filter \
-  --filter-val 20000000 \
   -n 1000 -k 10 --concurrency 100 \
   --filter-mode pre
 
 # force 模式测试（精确搜索，作为 baseline）
 python run_vector_test.py run \
   --sql-mode l2_filter \
-  --filter-val 20000000 \
   -n 1000 -k 10 --concurrency 100 \
   --filter-mode force
 ```
@@ -286,34 +210,7 @@ python run_vector_test.py run \
 | `-k` | 10 | Top-K |
 | `--concurrency` | 1 | 并发数 |
 | `--filter-val` | - | file_id 过滤值（用于 l2_filter 场景） |
-| `--duration` | - | 压测持续时间（秒） |
 | `--probe` | - | IVF 索引 probe 参数，控制查询时扫描的聚类数 |
 | `--distribute-file-ids` | - | 将查询分布到多个不同的 file_id |
 | `--max-distinct-file-ids` | 50 | 最多使用多少个不同的 file_id |
 | `--skip-db-verify` | - | 跳过数据库预检 |
-
-## 完整示例
-
-```bash
-#!/bin/bash
-
-# 下载数据集（以 1M 为例）
-curl -L -O https://data.rapids.ai/raft/datasets/wiki_all_1M/wiki_all_1M.tar
-tar -xf wiki_all_1M.tar
-
-# 一键完成所有步骤（创建表、导入、建索引、测试）
-python run_vector_test.py \
-  --host 127.0.0.1 \
-  --port 6001 \
-  --user dump \
-  --password 111 \
-  --database jst_app_wiki \
-  --table historical_file_blocks_wiki \
-  wiki setup \
-  --fbin wiki_all_1M/base.fbin \
-  --ivf-lists 100 \
-  --auto-test \
-  -n 1000 \
-  -k 10 \
-  --concurrency 4
-```
