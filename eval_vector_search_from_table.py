@@ -152,23 +152,29 @@ def set_session_env(env: dict) -> None:
     _SESSION_ENV = dict(env or {})
 
 
-_SESSION_ENV_LOGGED = False
+_SESSION_ENV_LOG_LOCK = Lock()
+_SESSION_ENV_LOG_CLAIMED = False
 
 
 def _apply_session_env(conn) -> None:
-    global _SESSION_ENV_LOGGED
+    """每个 worker 连接都应用一次；只有第一个进入的 worker（thread 0）负责打印。"""
+    global _SESSION_ENV_LOG_CLAIMED
     if not _SESSION_ENV:
         return
+    # 原子抢占打印权：第一个 worker 拿到 is_thread0=True，其余 False
+    with _SESSION_ENV_LOG_LOCK:
+        is_thread0 = not _SESSION_ENV_LOG_CLAIMED
+        if is_thread0:
+            _SESSION_ENV_LOG_CLAIMED = True
     with conn.cursor() as cur:
         for k, v in _SESSION_ENV.items():
             sql = f"SET {k} = '{v}'" if isinstance(v, str) else f"SET {k} = {v}"
             try:
                 cur.execute(sql)
-                if not _SESSION_ENV_LOGGED:
+                if is_thread0:
                     print(f"  [env] {sql}")
             except Exception as e:
                 print(f"  [env] 警告: {sql} 失败: {e}")
-        _SESSION_ENV_LOGGED = True
 
 
 # 线程级连接缓存：用于 precomputed-GT 召回路径，避免每条查询都新建连接
