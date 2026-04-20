@@ -83,7 +83,7 @@ def build_args(cli) -> SimpleNamespace:
     ns.distribute_file_ids = False
     ns.max_distinct_file_ids = 50
     ns.skip_db_verify = True
-    ns.probe = None
+    ns.probe = (cfg.get("env", {}) or {}).get("probe_limit")
     ns.filter_mode = None
     # run_eval 会从 _index_config["dataset"] 回退取这三个，这里显式置 None
     ns.query_fbin = None

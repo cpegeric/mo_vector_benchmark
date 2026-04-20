@@ -6,7 +6,7 @@ import pickle
 import struct
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
+from threading import Lock, local as _thread_local_cls
 from typing import Any, List, Optional, Tuple
 
 import pymysql
@@ -89,7 +89,7 @@ def _init_sql_mode_templates() -> Tuple[str, str, str]:
     lim = S3_L2_DISTANCE_MAX
     m1 = (
         f"SELECT `file_id`,`id` FROM {s1} "
-        f"ORDER BY l2_distance({ec}, %s) DESC LIMIT %s"
+        f"ORDER BY l2_distance({ec}, %s) ASC LIMIT %s"
     )
     m2 = (
         f"SELECT `file_id`, `id`, l2_distance({ec}, %s) AS dist "
@@ -140,6 +140,18 @@ NUM_QUERIES = 10000   # 默认抽样/评测条数；与 --duration 同时用时�
 
 def get_conn():
     return pymysql.connect(**DB_CONFIG)
+
+
+# 线程级连接缓存：用于 precomputed-GT 召回路径，避免每条查询都新建连接
+_tls_conn = _thread_local_cls()
+
+
+def get_thread_conn():
+    c = getattr(_tls_conn, "conn", None)
+    if c is None:
+        c = get_conn()
+        _tls_conn.conn = c
+    return c
 
 
 def row_to_eval_id(row: Tuple) -> str:
@@ -1016,22 +1028,21 @@ def evaluate_single_query_with_precomputed_gt(
     - 与提供的 gt_ids 做召回率计算
     返回 (recall, gt_ids, vec_literal, latency_sec)。
     """
-    conn = get_conn()
-    try:
-        t0 = time.perf_counter()
-        res = get_index_result_ids(
-            conn,
-            vec_literal,
-            k,
-            mode_int,
-            filter_val=filter_val,
-            filter_mode=filter_mode,
-        )
-        latency = time.perf_counter() - t0
-        r = recall_at_k(gt_ids, res, k)
-        return r, gt_ids, vec_literal, latency
-    finally:
-        conn.close()
+    conn = get_thread_conn()
+    t0 = time.perf_counter()
+    res = get_index_result_ids(
+        conn,
+        vec_literal,
+        k,
+        mode_int,
+        filter_val=filter_val,
+        filter_mode=filter_mode,
+    )
+    latency = time.perf_counter() - t0
+    # wiki_all 文件 GT（.ibin）只含 id；此处剥离 SQL 结果里的 "file_id\\t" 前缀
+    res_ids_only = [r.split("\t")[-1] for r in res]
+    r = recall_at_k(gt_ids, res_ids_only, k)
+    return r, gt_ids, vec_literal, latency
 
 
 def recall_at_k(gt_ids: List[str], res_ids: List[str], k: int) -> float:
