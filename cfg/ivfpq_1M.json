@@ -10,7 +10,7 @@
     "type": "ivfpq",
     "lists": 1024,
     "bits_per_code": 8,
-    "m": 384,
+    "m": 192,
     "quantization": "float32",
     "op_type": "vector_l2_ops",
     "distribution_mode": "single"
