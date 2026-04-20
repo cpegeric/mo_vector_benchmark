@@ -18,7 +18,7 @@
     "experimental_hnsw_index": 1
   },
   "dataset": {
-    "base_fbin": "/path/to/wiki_all_1M.fbin",
+    "base_fbin": ["/path/to/wiki_all_1M.fbin"],
     "query_fbin": "/path/to/queries.fbin",
     "groundtruth_ibin": "/path/to/groundtruth.neighbors.ibin",
     "id_offset": 1
