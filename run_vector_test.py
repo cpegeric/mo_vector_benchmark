@@ -497,6 +497,12 @@ def run_eval(args):
     if hasattr(args, 'probe') and args.probe is not None:
         cmd.extend(["--probe", str(args.probe)])
 
+    # 会话级 env：把 cfg.env 整体透传给 eval（每个 worker 连接都会 SET key=value）
+    _cfg_for_env = getattr(args, "_index_config", None) or {}
+    _env_for_session = _cfg_for_env.get("env") or {}
+    if _env_for_session:
+        cmd.extend(["--session-env-json", json.dumps(_env_for_session)])
+
     # filter_mode 设置
     if hasattr(args, 'filter_mode') and args.filter_mode:
         cmd.extend(["--filter-mode", args.filter_mode])

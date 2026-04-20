@@ -142,6 +142,35 @@ def get_conn():
     return pymysql.connect(**DB_CONFIG)
 
 
+# 会话级 env：每次新建 connection 时 SET key=value（镜像 vector_benchmark/db.py:set_env）
+_SESSION_ENV: dict = {}
+
+
+def set_session_env(env: dict) -> None:
+    """供启动阶段注入 cfg.env；后续每个 thread conn 都会应用。"""
+    global _SESSION_ENV
+    _SESSION_ENV = dict(env or {})
+
+
+_SESSION_ENV_LOGGED = False
+
+
+def _apply_session_env(conn) -> None:
+    global _SESSION_ENV_LOGGED
+    if not _SESSION_ENV:
+        return
+    with conn.cursor() as cur:
+        for k, v in _SESSION_ENV.items():
+            sql = f"SET {k} = '{v}'" if isinstance(v, str) else f"SET {k} = {v}"
+            try:
+                cur.execute(sql)
+                if not _SESSION_ENV_LOGGED:
+                    print(f"  [env] {sql}")
+            except Exception as e:
+                print(f"  [env] 警告: {sql} 失败: {e}")
+        _SESSION_ENV_LOGGED = True
+
+
 # 线程级连接缓存：用于 precomputed-GT 召回路径，避免每条查询都新建连接
 _tls_conn = _thread_local_cls()
 
@@ -150,6 +179,7 @@ def get_thread_conn():
     c = getattr(_tls_conn, "conn", None)
     if c is None:
         c = get_conn()
+        _apply_session_env(c)
         _tls_conn.conn = c
     return c
 
@@ -1924,6 +1954,12 @@ def parse_args() -> argparse.Namespace:
         help="设置 probe_limit 值（用于 IVF 索引查询）",
     )
     parser.add_argument(
+        "--session-env-json",
+        type=str,
+        default=None,
+        help="JSON 字典：每个新建 DB 连接都会 SET key=value（供 cagra 等索引的 experimental_* env）",
+    )
+    parser.add_argument(
         "--filter-mode",
         type=str,
         default=None,
@@ -1958,6 +1994,12 @@ if __name__ == "__main__":
         TABLE_NAME = args.table
         # 刷新 SQL 模板
         refresh_sql_mode_templates()
+    # 会话级 env（供 cagra 等需要 experimental_cagra_index=1 的索引）
+    if args.session_env_json:
+        try:
+            set_session_env(json.loads(args.session_env_json))
+        except Exception as e:
+            print(f"[env] 警告: --session-env-json 解析失败: {e}")
     evaluate(
         num_queries=args.num_queries,
         k=args.k,

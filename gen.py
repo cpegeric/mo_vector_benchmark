@@ -60,23 +60,21 @@ FILE_ID_BASE_DEFAULT = 20_000_000
 PAGE_NUM_MOD_DEFAULT = 800
 
 
-def _emb_component(x: float) -> str:
-    if not np.isfinite(x):
-        return "0"
-    xf = float(np.float32(x))
-    if xf == 0.0:
-        return "0"
-    s = f"{xf:.10f}"
-    if "." in s:
-        s = s.rstrip("0").rstrip(".")
-    if s == "-0":
-        return "0"
-    return s
-
-
 def _emb_literal(v: np.ndarray) -> str:
+    """向量化格式化：一次把整个 768 维向量转成 "[v1,v2,...]"，
+    对等价于旧的逐元素 f"{x:.10f}" + rstrip('0').rstrip('.') 语义。
+    """
     v = np.asarray(v, dtype=np.float32).ravel()
-    return "[" + ",".join(_emb_component(float(t)) for t in v) + "]"
+    # 非有限值 → 0
+    v = np.where(np.isfinite(v), v, np.float32(0.0))
+    # 整行一次性 %.10f
+    parts = np.char.mod("%.10f", v)
+    # 裁剪尾随 0 与孤悬小数点
+    parts = np.char.rstrip(parts, "0")
+    parts = np.char.rstrip(parts, ".")
+    # "-0" / "" → "0"
+    parts = np.where((parts == "-0") | (parts == ""), "0", parts)
+    return "[" + ",".join(parts) + "]"
 
 
 def _read_fbin_header(path: str) -> Tuple[int, int]:
@@ -121,14 +119,21 @@ def _open_csv_writer(path: str):
     return fp, w
 
 
+def _sanitize_content(s: str) -> str:
+    """移除 content 中的换行，避免 LOAD DATA 在 PARALLEL 分片或解析时把一行拆成多行。
+    用 ' | ' 替代以保留分隔语义。
+    """
+    return s.replace("\r\n", " | ").replace("\n", " | ").replace("\r", " | ")
+
+
 def _write_row(w, i: int, vec: np.ndarray,
                file_id_base: int, distinct_file_ids: int, page_num_mod: int,
                rng: np.random.Generator) -> None:
     w.writerow(
         [
-            "\\N",
+            i,
             file_id_base + (i - 1) % distinct_file_ids,
-            _content_line(i, rng),
+            _sanitize_content(_content_line(i, rng)),
             _emb_literal(vec),
             (i - 1) % page_num_mod + 1,
             _meta_obj(i, rng),
