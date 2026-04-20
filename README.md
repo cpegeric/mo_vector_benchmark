@@ -120,11 +120,27 @@ python run_wiki.py <command> --config cfg/xxx.json [options]
 |------|------|
 | `all` | 顺序执行 create_table → import → create_index → recall |
 | `create_table` | 仅创建表 |
-| `import` | 仅导入数据；默认走 `.fbin` INSERT，加 `--csv PATH` 改走 LOAD DATA LOCAL INFILE（显著更快） |
+| `import` | 仅导入数据；默认走 `.fbin` INSERT，加 `--csv PATH` 或 `--input-csv-prefix PREFIX` 改走 LOAD DATA INFILE（显著更快） |
 | `create_index` | 仅创建向量索引（读取 `cfg.index` 与 `cfg.env`） |
 | `drop_index` | 删除索引（索引名取自 `cfg.index.name`，同时尝试清理旧名 `idx_embedding`） |
 | `gen_csv` | 将 `dataset.base_fbin` 转为 6 列 CSV（LOAD DATA 兼容），不连库 |
 | `recall` | 仅跑召回评估（自动把 `cfg.env.probe_limit` 设置到查询 session） |
+
+`dataset.base_fbin` 可为单个字符串或字符串数组，用于多 shard 数据集：
+
+```json
+"dataset": {
+  "base_fbin": [
+    "/data/wiki_88M/base.00.fbin",
+    "/data/wiki_88M/base.01.fbin"
+  ],
+  "query_fbin": "/data/wiki_88M/queries.fbin",
+  "groundtruth_ibin": "/data/wiki_88M/groundtruth.neighbors.ibin",
+  "id_offset": 1
+}
+```
+
+多 .fbin 时，全局 1-based 行号 `i` 跨文件连续递增（shard0: 1..N0，shard1: N0+1..N0+N1 ...），保持 `file_id` / `page_num` / `content` / `meta` 分布不变。
 
 **典型用法**
 
@@ -132,10 +148,16 @@ python run_wiki.py <command> --config cfg/xxx.json [options]
 # 全流程（INSERT 导入）
 python run_wiki.py all --config cfg/ivfpq_1M.json -n 5000 -k 100 --concurrency 32
 
-# 先生成 CSV，再用 LOAD DATA 走全流程（百万级数据导入从分钟级降到秒级）
+# 先生成单个 CSV，再用 LOAD DATA 走全流程（百万级数据导入从分钟级降到秒级）
 python run_wiki.py gen_csv --config cfg/ivfpq_1M.json --output /tmp/wiki_1M.csv
 python run_wiki.py all --config cfg/ivfpq_1M.json --csv /tmp/wiki_1M.csv \
     -n 5000 -k 100 --concurrency 32
+
+# 多 CSV 分片：每个 .fbin 对应一个 CSV，再按前缀 LOAD
+python run_wiki.py gen_csv --config cfg/my_sharded.json --output-csv-prefix /tmp/wiki_
+#   生成：/tmp/wiki_0.csv, /tmp/wiki_1.csv, /tmp/wiki_2.csv ...
+python run_wiki.py import --config cfg/my_sharded.json --input-csv-prefix /tmp/wiki_
+#   按顺序对匹配到的每个 CSV 执行一次 LOAD DATA INFILE
 
 # 迭代索引调参：只重建索引 + 重跑召回
 python run_wiki.py drop_index   --config cfg/ivfpq_1M.json
@@ -148,14 +170,18 @@ python run_wiki.py recall       --config cfg/ivfpq_1M.json -n 5000 -k 100 --conc
 | 参数 | 适用命令 | 说明 |
 |------|---------|------|
 | `--config` | 全部 | JSON 配置文件路径（必填） |
-| `--csv` | `all` / `import` | 走 LOAD DATA 路径的 CSV 文件（由 `gen_csv` 生成） |
+| `--csv PATH` | `all` / `import` | 走 LOAD DATA 路径的单个 CSV 文件 |
+| `--input-csv-prefix PREFIX` | `all` / `import` | 匹配 `{PREFIX}*.csv`，按顺序逐个 LOAD DATA |
+| `-o, --output PATH` | `gen_csv` | 输出单个 CSV 路径 |
+| `--output-csv-prefix PREFIX` | `gen_csv` | 按前缀输出多个 CSV（每个 .fbin 对应 `{PREFIX}0.csv` ...） |
 | `-n` / `-k` / `--concurrency` / `--sql-mode` | `all` / `recall` | 召回评估参数 |
-| `-o, --output` | `gen_csv` | 输出 CSV 路径（必填） |
 | `--expected-dim` | `gen_csv` | 期望向量维度（默认 768） |
 | `--batch-size` | `all` / `import` | INSERT 批量大小（默认 20000） |
 | `--file-id-base` / `--distinct-file-ids` | `all` / `import` / `gen_csv` | file_id 生成规则 |
 
 > `run_wiki.py` 会自动从 `cfg.env.probe_limit` 设置 IVF 查询的 probe 参数，无需手动传 `--probe`，与 `vector_benchmark/gtrecall.py` 的默认行为一致。
+>
+> `LOAD DATA INFILE`（非 `LOCAL`）由 MatrixOne 服务端读取 CSV，CSV 文件必须放在服务端可访问的路径。若 MO 与脚本不在同一台机器，需先把 CSV 拷贝到 MO 所在机器。
 
 表结构：
 

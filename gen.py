@@ -113,10 +113,33 @@ def _iter_fbin_batches(
             first_idx += take
 
 
+def _open_csv_writer(path: str):
+    fp = open(path, "w", encoding="utf-8", newline="")
+    w = csv.writer(fp, quoting=csv.QUOTE_MINIMAL, lineterminator="\r\n")
+    # Header（LOAD DATA IGNORE 1 LINES 会跳过）
+    w.writerow(["id", "file_id", "content", "embedding", "page_num", "meta"])
+    return fp, w
+
+
+def _write_row(w, i: int, vec: np.ndarray,
+               file_id_base: int, distinct_file_ids: int, page_num_mod: int,
+               rng: np.random.Generator) -> None:
+    w.writerow(
+        [
+            "\\N",
+            file_id_base + (i - 1) % distinct_file_ids,
+            _content_line(i, rng),
+            _emb_literal(vec),
+            (i - 1) % page_num_mod + 1,
+            _meta_obj(i, rng),
+        ]
+    )
+
+
 def convert_fbin_to_csv(
     fbin_path: Union[str, List[str]],
-    output_file: str,
-    expected_dim: int,
+    output_file: str | None = None,
+    expected_dim: int = 768,
     batch_size: int = 2000,
     skip_rows: int = 0,
     max_rows: int | None = None,
@@ -125,77 +148,126 @@ def convert_fbin_to_csv(
     page_num_mod: int = PAGE_NUM_MOD_DEFAULT,
     seed: int = 42,
     progress_every: int = 50_000,
-) -> int:
-    """将一个或多个 .fbin 文件转换为单个 CSV。`fbin_path` 可为字符串或字符串列表；
-    多个文件时按列表顺序顺延行号 i（全局 1-based），保持 file_id / page_num / meta / content
-    分布与单文件语义一致。
+    output_prefix: str | None = None,
+) -> List[str]:
+    """将一个或多个 .fbin 文件转换为 CSV。返回生成的 CSV 路径列表。
+
+    - output_file：合并写入到单个 CSV。
+    - output_prefix：每个 .fbin 生成一个 CSV（{prefix}0.csv、{prefix}1.csv ...）。
+    两者必须二选一。
+
+    多文件场景下全局行号 i 连续递增（shard1: 1..N1，shard2: N1+1..N1+N2 ...），
+    保持 file_id / page_num / meta / content 分布与单文件语义一致。
     """
+    if (output_file is None) == (output_prefix is None):
+        raise ValueError("必须提供 output_file 或 output_prefix 之一")
+
     paths = [fbin_path] if isinstance(fbin_path, str) else list(fbin_path)
     if not paths:
         raise ValueError("fbin_path 为空")
 
-    # 校验每个文件维度一致，且打印总行数
     totals = []
     for p in paths:
         n, d = _read_fbin_header(p)
         if d != expected_dim:
             raise ValueError(f"{p} dim={d} 与 --expected-dim={expected_dim} 不一致")
         totals.append(n)
-    print(
-        f"读取 {len(paths)} 个 .fbin 文件（总 n={sum(totals)}, dim={expected_dim}），写入 CSV → {output_file}",
-        file=sys.stderr,
-    )
 
-    out_dir = os.path.dirname(os.path.abspath(output_file))
-    if out_dir and not os.path.exists(out_dir):
-        os.makedirs(out_dir, exist_ok=True)
+    if output_file is not None:
+        print(
+            f"读取 {len(paths)} 个 .fbin（总 n={sum(totals)}, dim={expected_dim}），"
+            f"合并写入 CSV → {output_file}",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"读取 {len(paths)} 个 .fbin（总 n={sum(totals)}, dim={expected_dim}），"
+            f"按前缀分片写入 CSV → {output_prefix}{{0..{len(paths)-1}}}.csv",
+            file=sys.stderr,
+        )
 
     rng = np.random.default_rng(seed)
-    written = 0  # 已写入 CSV 的行数
-    global_i = 1  # 跨文件的 1-based 全局行号（决定 file_id / page_num / meta / content）
+    written = 0
+    global_i = 1
+    outputs: List[str] = []
 
-    tmp = output_file + ".tmp"
-    with open(tmp, "w", encoding="utf-8", newline="") as fp:
-        w = csv.writer(
-            fp,
-            quoting=csv.QUOTE_MINIMAL,
-            lineterminator="\r\n",
+    def _ensure_dir_for(path: str) -> None:
+        d = os.path.dirname(os.path.abspath(path))
+        if d and not os.path.exists(d):
+            os.makedirs(d, exist_ok=True)
+
+    if output_file is not None:
+        _ensure_dir_for(output_file)
+        tmp = output_file + ".tmp"
+        fp, w = _open_csv_writer(tmp)
+        try:
+            for pi, path in enumerate(paths):
+                file_skip = skip_rows if pi == 0 else 0
+                file_max = max_rows if pi == 0 and max_rows is not None else None
+                print(f"  [{pi + 1}/{len(paths)}] {path}", file=sys.stderr, flush=True)
+                for _first_idx_in_file, mat in _iter_fbin_batches(
+                    path, batch_size, file_skip, file_max
+                ):
+                    b = mat.shape[0]
+                    for j in range(b):
+                        _write_row(
+                            w, global_i + j, mat[j],
+                            file_id_base, distinct_file_ids, page_num_mod, rng,
+                        )
+                    global_i += b
+                    written += b
+                    if written % progress_every < batch_size:
+                        print(f"  wrote {written} rows...", file=sys.stderr, flush=True)
+        finally:
+            fp.close()
+        os.replace(tmp, output_file)
+        st = os.stat(output_file)
+        print(
+            f"完成：{output_file} ({st.st_size / (1024**3):.3f} GiB, {written} 行)",
+            file=sys.stderr,
         )
-        # Header line（LOAD DATA IGNORE 1 LINES 会跳过）
-        w.writerow(["id", "file_id", "content", "embedding", "page_num", "meta"])
-
+        outputs.append(output_file)
+    else:
         for pi, path in enumerate(paths):
-            file_skip = skip_rows if pi == 0 else 0
-            file_max = max_rows if pi == 0 and max_rows is not None else None
-            print(f"  [{pi + 1}/{len(paths)}] {path}", file=sys.stderr, flush=True)
-            for _first_idx_in_file, mat in _iter_fbin_batches(
-                path, batch_size, file_skip, file_max
-            ):
-                b = mat.shape[0]
-                for j in range(b):
-                    i = global_i + j
-                    w.writerow(
-                        [
-                            "\\N",
-                            file_id_base + (i - 1) % distinct_file_ids,
-                            _content_line(i, rng),
-                            _emb_literal(mat[j]),
-                            (i - 1) % page_num_mod + 1,
-                            _meta_obj(i, rng),
-                        ]
-                    )
-                global_i += b
-                written += b
-                if written % progress_every < batch_size:
-                    print(f"  wrote {written} rows...", file=sys.stderr, flush=True)
+            out_path = f"{output_prefix}{pi}.csv"
+            _ensure_dir_for(out_path)
+            tmp = out_path + ".tmp"
+            fp, w = _open_csv_writer(tmp)
+            file_written = 0
+            try:
+                file_skip = skip_rows if pi == 0 else 0
+                file_max = max_rows if pi == 0 and max_rows is not None else None
+                print(
+                    f"  [{pi + 1}/{len(paths)}] {path} → {out_path}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                for _first_idx_in_file, mat in _iter_fbin_batches(
+                    path, batch_size, file_skip, file_max
+                ):
+                    b = mat.shape[0]
+                    for j in range(b):
+                        _write_row(
+                            w, global_i + j, mat[j],
+                            file_id_base, distinct_file_ids, page_num_mod, rng,
+                        )
+                    global_i += b
+                    written += b
+                    file_written += b
+                    if written % progress_every < batch_size:
+                        print(f"  wrote {written} rows...", file=sys.stderr, flush=True)
+            finally:
+                fp.close()
+            os.replace(tmp, out_path)
+            st = os.stat(out_path)
+            print(
+                f"  -> {out_path} ({st.st_size / (1024**3):.3f} GiB, {file_written} 行)",
+                file=sys.stderr,
+            )
+            outputs.append(out_path)
+        print(f"完成：共 {len(outputs)} 个 CSV，总 {written} 行", file=sys.stderr)
 
-    os.replace(tmp, output_file)
-    st = os.stat(output_file)
-    print(
-        f"完成：{output_file} ({st.st_size / (1024**3):.3f} GiB, {written} 行)",
-        file=sys.stderr,
-    )
-    return written
+    return outputs
 
 
 def load_csv_into_matrixone(
@@ -261,11 +333,20 @@ def main() -> int:
     src.add_argument(
         "--fbin",
         nargs="+",
-        help="输入 .fbin 路径，可指定多个（cuVS/RAFT 格式，按顺序拼接为单个 CSV）",
+        help="输入 .fbin 路径，可指定多个（cuVS/RAFT 格式，按顺序全局行号连续）",
     )
     src.add_argument("--csv", help="已有 CSV 路径（跳过生成，直接 --load）")
+    src.add_argument(
+        "--csv-prefix",
+        help="已有 CSV 前缀（匹配 {prefix}*.csv，全部 --load）",
+    )
 
-    ap.add_argument("-o", "--output", help="输出 CSV 路径（与 --fbin 搭配）")
+    out_grp = ap.add_mutually_exclusive_group()
+    out_grp.add_argument("-o", "--output", help="输出到单个 CSV（与 --fbin 搭配）")
+    out_grp.add_argument(
+        "--output-csv-prefix",
+        help="输出到多个 CSV（{prefix}0.csv, {prefix}1.csv ...），每个 .fbin 对应一个 CSV",
+    )
     ap.add_argument("--expected-dim", type=int, default=768)
     ap.add_argument("--batch-size", type=int, default=2000, help="读取 .fbin 每批行数")
     ap.add_argument("--skip-rows", type=int, default=0)
@@ -287,12 +368,13 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.fbin:
-        if not args.output:
-            print("错误：使用 --fbin 时需提供 --output", file=sys.stderr)
+        if not args.output and not args.output_csv_prefix:
+            print("错误：使用 --fbin 时需提供 --output 或 --output-csv-prefix", file=sys.stderr)
             return 2
-        convert_fbin_to_csv(
+        csv_paths = convert_fbin_to_csv(
             fbin_path=args.fbin,
             output_file=args.output,
+            output_prefix=args.output_csv_prefix,
             expected_dim=args.expected_dim,
             batch_size=args.batch_size,
             skip_rows=args.skip_rows,
@@ -302,20 +384,29 @@ def main() -> int:
             page_num_mod=args.page_num_mod,
             seed=args.seed,
         )
-        csv_path = args.output
-    else:
-        csv_path = args.csv
+    elif args.csv:
+        csv_paths = [args.csv]
+    else:  # args.csv_prefix
+        import glob as _glob
+        csv_paths = sorted(_glob.glob(f"{args.csv_prefix}*.csv"))
+        if not csv_paths:
+            print(f"错误：未匹配到 {args.csv_prefix}*.csv", file=sys.stderr)
+            return 2
+        print(f"发现 {len(csv_paths)} 个 CSV：", file=sys.stderr)
+        for p in csv_paths:
+            print(f"  - {p}", file=sys.stderr)
 
     if args.load:
-        load_csv_into_matrixone(
-            csv_path=csv_path,
-            host=args.host,
-            port=args.port,
-            user=args.user,
-            password=args.password,
-            database=args.database,
-            table=args.table,
-        )
+        for p in csv_paths:
+            load_csv_into_matrixone(
+                csv_path=p,
+                host=args.host,
+                port=args.port,
+                user=args.user,
+                password=args.password,
+                database=args.database,
+                table=args.table,
+            )
     return 0
 
 

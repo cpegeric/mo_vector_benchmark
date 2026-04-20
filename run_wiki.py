@@ -112,19 +112,36 @@ def build_args(cli) -> SimpleNamespace:
     return ns
 
 
-def _validate_import_paths(ns: SimpleNamespace, cli) -> int:
+def _resolve_input_csvs(cli) -> list[str] | None:
+    """根据 CLI 返回用于 LOAD DATA 的 CSV 路径列表；若未指定 CSV 路径返回 None。"""
     if cli.csv:
-        if not os.path.exists(cli.csv):
-            print(f"错误: --csv 文件不存在: {cli.csv}")
+        return [cli.csv]
+    if cli.input_csv_prefix:
+        import glob as _glob
+        matched = sorted(_glob.glob(f"{cli.input_csv_prefix}*.csv"))
+        return matched
+    return None
+
+
+def _validate_import_paths(ns: SimpleNamespace, cli) -> int:
+    csvs = _resolve_input_csvs(cli)
+    if csvs is not None:
+        if not csvs:
+            print(f"错误: --input-csv-prefix 未匹配到 {cli.input_csv_prefix}*.csv")
             return 1
-    else:
-        if not ns.fbin:
-            print("错误: JSON 的 dataset.base_fbin 未设置，且未提供 --csv。")
-            return 1
-        for p in ns.fbin:
+        for p in csvs:
             if not os.path.exists(p):
-                print(f"错误: base_fbin 文件不存在: {p}")
+                print(f"错误: CSV 文件不存在: {p}")
                 return 1
+        return 0
+    # fbin 路径
+    if not ns.fbin:
+        print("错误: JSON 的 dataset.base_fbin 未设置，且未提供 --csv/--input-csv-prefix。")
+        return 1
+    for p in ns.fbin:
+        if not os.path.exists(p):
+            print(f"错误: base_fbin 文件不存在: {p}")
+            return 1
     return 0
 
 
@@ -152,19 +169,23 @@ def _banner(title: str) -> None:
 
 
 def _make_import_fn(ns: SimpleNamespace, cli):
-    if cli.csv:
+    csvs = _resolve_input_csvs(cli)
+    if csvs is not None:
         def _import_via_csv(ns_):
-            load_csv_into_matrixone(
-                csv_path=cli.csv,
-                host=ns_.host,
-                port=ns_.port,
-                user=ns_.user,
-                password=ns_.password,
-                database=ns_.database,
-                table=ns_.table,
-            )
+            for p in csvs:
+                print(f"[run_wiki] LOAD DATA: {p}", flush=True)
+                load_csv_into_matrixone(
+                    csv_path=p,
+                    host=ns_.host,
+                    port=ns_.port,
+                    user=ns_.user,
+                    password=ns_.password,
+                    database=ns_.database,
+                    table=ns_.table,
+                )
             return 0
-        return "import (csv LOAD DATA)", _import_via_csv
+        suffix = f" x{len(csvs)}" if len(csvs) > 1 else ""
+        return f"import (csv LOAD DATA{suffix})", _import_via_csv
     return "import", run_wiki_import
 
 
@@ -176,12 +197,16 @@ def _gen_csv(ns: SimpleNamespace, cli) -> int:
         if not os.path.exists(p):
             print(f"错误: base_fbin 文件不存在: {p}")
             return 1
-    if not cli.output:
-        print("错误: gen_csv 需要 --output 指定输出 CSV 路径。")
+    if not cli.output and not cli.output_csv_prefix:
+        print("错误: gen_csv 需要 --output 或 --output-csv-prefix 之一。")
+        return 1
+    if cli.output and cli.output_csv_prefix:
+        print("错误: --output 与 --output-csv-prefix 不能同时指定。")
         return 1
     convert_fbin_to_csv(
         fbin_path=ns.fbin,
         output_file=cli.output,
+        output_prefix=cli.output_csv_prefix,
         expected_dim=cli.expected_dim,
         batch_size=cli.gen_batch_size,
         file_id_base=cli.file_id_base,
@@ -254,11 +279,21 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--csv",
         default=None,
-        help="使用 LOAD DATA LOCAL INFILE 从 CSV 导入（替代 .fbin INSERT 路径）。",
+        help="单个 CSV 文件，用于 LOAD DATA（替代 .fbin INSERT 路径）。",
+    )
+    parser.add_argument(
+        "--input-csv-prefix",
+        default=None,
+        help="输入 CSV 前缀，匹配 {prefix}*.csv 全部 LOAD DATA（import/all 步骤）。",
     )
 
     # gen_csv 专用
-    parser.add_argument("-o", "--output", default=None, help="gen_csv 输出 CSV 路径")
+    parser.add_argument("-o", "--output", default=None, help="gen_csv 输出单个 CSV 路径")
+    parser.add_argument(
+        "--output-csv-prefix",
+        default=None,
+        help="gen_csv 输出多个 CSV（{prefix}0.csv、{prefix}1.csv ...），每个 .fbin 对应一个",
+    )
     parser.add_argument("--expected-dim", type=int, default=768, help="gen_csv 期望向量维度")
     parser.add_argument("--gen-batch-size", type=int, default=2000, help="gen_csv 读取 .fbin 每批行数")
     parser.add_argument("--distinct-file-ids", type=int, default=50, help="gen_csv file_id 循环个数")
