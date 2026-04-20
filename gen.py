@@ -148,8 +148,10 @@ def convert_fbin_to_csv(
         w = csv.writer(
             fp,
             quoting=csv.QUOTE_MINIMAL,
-            lineterminator="\n",
+            lineterminator="\r\n",
         )
+        # Header line（LOAD DATA IGNORE 1 LINES 会跳过）
+        w.writerow(["id", "file_id", "content", "embedding", "page_num", "meta"])
         for first_i, mat in _iter_fbin_batches(
             fbin_path, batch_size, skip_rows, max_rows
         ):
@@ -198,7 +200,7 @@ def load_csv_into_matrixone(
     if not os.path.exists(abs_path):
         raise FileNotFoundError(abs_path)
 
-    # LOCAL INFILE 需要客户端启用 local_infile；pymysql 的 connect 参数 local_infile=True
+    # 使用服务端 LOAD DATA INFILE（非 LOCAL），CSV 必须在 MatrixOne 服务端可访问路径上。
     conn = pymysql.connect(
         host=host,
         port=port,
@@ -206,21 +208,25 @@ def load_csv_into_matrixone(
         password=password,
         database=database,
         charset="utf8mb4",
-        local_infile=True,
         autocommit=False,
         connect_timeout=120,
         read_timeout=3600,
         write_timeout=3600,
     )
+    tbl = f"`{table}`"
     sql = (
-        f"LOAD DATA LOCAL INFILE %s INTO TABLE `{table}` "
-        f"FIELDS TERMINATED BY ',' ENCLOSED BY '\"' ESCAPED BY '' "
-        f"LINES TERMINATED BY '\\n'"
+        f"LOAD DATA INFILE '{abs_path}' "
+        f"INTO TABLE {tbl} "
+        f"FIELDS TERMINATED BY ',' "
+        f"ENCLOSED BY '\"' "
+        f"LINES TERMINATED BY '\\r\\n' "
+        f"IGNORE 1 LINES "
+        f"PARALLEL 'true'"
     )
-    print(f"执行：{sql} (file={abs_path})", file=sys.stderr)
+    print(f"执行：{sql}", file=sys.stderr)
     try:
         with conn.cursor() as cur:
-            cur.execute(sql, (abs_path,))
+            cur.execute(sql)
             affected = cur.rowcount
         conn.commit()
         print(f"LOAD DATA 完成：affected_rows={affected}", file=sys.stderr)
