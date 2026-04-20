@@ -83,7 +83,13 @@ def build_args(cli) -> SimpleNamespace:
     ns._index_config = cfg
 
     dataset = cfg.get("dataset", {}) or {}
-    ns.fbin = dataset.get("base_fbin")
+    raw_fbin = dataset.get("base_fbin")
+    if raw_fbin is None:
+        ns.fbin = None
+    elif isinstance(raw_fbin, str):
+        ns.fbin = [raw_fbin]
+    else:
+        ns.fbin = list(raw_fbin)
     ns.csv = cli.csv
     ns.batch_size = cli.batch_size
     ns.file_id_base = cli.file_id_base
@@ -115,9 +121,10 @@ def _validate_import_paths(ns: SimpleNamespace, cli) -> int:
         if not ns.fbin:
             print("错误: JSON 的 dataset.base_fbin 未设置，且未提供 --csv。")
             return 1
-        if not os.path.exists(ns.fbin):
-            print(f"错误: base_fbin 文件不存在: {ns.fbin}")
-            return 1
+        for p in ns.fbin:
+            if not os.path.exists(p):
+                print(f"错误: base_fbin 文件不存在: {p}")
+                return 1
     return 0
 
 
@@ -165,9 +172,10 @@ def _gen_csv(ns: SimpleNamespace, cli) -> int:
     if not ns.fbin:
         print("错误: JSON 的 dataset.base_fbin 未设置，无法生成 CSV。")
         return 1
-    if not os.path.exists(ns.fbin):
-        print(f"错误: base_fbin 文件不存在: {ns.fbin}")
-        return 1
+    for p in ns.fbin:
+        if not os.path.exists(p):
+            print(f"错误: base_fbin 文件不存在: {p}")
+            return 1
     if not cli.output:
         print("错误: gen_csv 需要 --output 指定输出 CSV 路径。")
         return 1

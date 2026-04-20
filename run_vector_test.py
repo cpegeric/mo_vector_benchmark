@@ -283,9 +283,11 @@ def run_wiki_import(args):
         print("错误: 请指定 --fbin 参数提供 .fbin 文件路径")
         return 1
 
-    if not os.path.exists(args.fbin):
-        print(f"错误: .fbin 文件不存在: {args.fbin}")
-        return 1
+    fbin_list = [args.fbin] if isinstance(args.fbin, str) else list(args.fbin)
+    for p in fbin_list:
+        if not os.path.exists(p):
+            print(f"错误: .fbin 文件不存在: {p}")
+            return 1
 
     cmd = [
         "python3",
@@ -296,9 +298,9 @@ def run_wiki_import(args):
         "--password", str(args.password),
         "--database", str(args.database),
         "--table", str(args.table),
-        "--fbin", str(args.fbin),
         "--batch-size", str(args.batch_size),
         "--file-id-base", str(args.file_id_base),
+        "--fbin", *fbin_list,
     ]
 
     print(f"运行: {' '.join(cmd)}")

@@ -24,7 +24,7 @@
     "cagra_threads_search": 0
   },
   "dataset": {
-    "base_fbin": "/home/ubuntu/github/vector_benchmark/wiki_all_10M/base.10M.fbin",
+    "base_fbin": ["/home/ubuntu/github/vector_benchmark/wiki_all_10M/base.10M.fbin"],
     "query_fbin": "/home/ubuntu/github/vector_benchmark/wiki_all_10M/queries.fbin",
     "groundtruth_ibin": "/home/ubuntu/github/vector_benchmark/wiki_all_10M/groundtruth.10M.neighbors.ibin",
     "id_offset": 1

@@ -40,7 +40,7 @@ import csv
 import os
 import struct
 import sys
-from typing import Iterator, Tuple
+from typing import Iterator, List, Tuple, Union
 
 _pkg_dir = os.path.dirname(os.path.abspath(__file__))
 if _pkg_dir not in sys.path:
@@ -114,7 +114,7 @@ def _iter_fbin_batches(
 
 
 def convert_fbin_to_csv(
-    fbin_path: str,
+    fbin_path: Union[str, List[str]],
     output_file: str,
     expected_dim: int,
     batch_size: int = 2000,
@@ -126,13 +126,23 @@ def convert_fbin_to_csv(
     seed: int = 42,
     progress_every: int = 50_000,
 ) -> int:
-    n_total, d = _read_fbin_header(fbin_path)
-    if d != expected_dim:
-        raise ValueError(
-            f"文件 dim={d} 与 --expected-dim={expected_dim} 不一致"
-        )
+    """将一个或多个 .fbin 文件转换为单个 CSV。`fbin_path` 可为字符串或字符串列表；
+    多个文件时按列表顺序顺延行号 i（全局 1-based），保持 file_id / page_num / meta / content
+    分布与单文件语义一致。
+    """
+    paths = [fbin_path] if isinstance(fbin_path, str) else list(fbin_path)
+    if not paths:
+        raise ValueError("fbin_path 为空")
+
+    # 校验每个文件维度一致，且打印总行数
+    totals = []
+    for p in paths:
+        n, d = _read_fbin_header(p)
+        if d != expected_dim:
+            raise ValueError(f"{p} dim={d} 与 --expected-dim={expected_dim} 不一致")
+        totals.append(n)
     print(
-        f"读取 {fbin_path}（n={n_total}, dim={d}），写入 CSV → {output_file}",
+        f"读取 {len(paths)} 个 .fbin 文件（总 n={sum(totals)}, dim={expected_dim}），写入 CSV → {output_file}",
         file=sys.stderr,
     )
 
@@ -141,7 +151,8 @@ def convert_fbin_to_csv(
         os.makedirs(out_dir, exist_ok=True)
 
     rng = np.random.default_rng(seed)
-    written = 0
+    written = 0  # 已写入 CSV 的行数
+    global_i = 1  # 跨文件的 1-based 全局行号（决定 file_id / page_num / meta / content）
 
     tmp = output_file + ".tmp"
     with open(tmp, "w", encoding="utf-8", newline="") as fp:
@@ -152,25 +163,31 @@ def convert_fbin_to_csv(
         )
         # Header line（LOAD DATA IGNORE 1 LINES 会跳过）
         w.writerow(["id", "file_id", "content", "embedding", "page_num", "meta"])
-        for first_i, mat in _iter_fbin_batches(
-            fbin_path, batch_size, skip_rows, max_rows
-        ):
-            b = mat.shape[0]
-            for j in range(b):
-                i = first_i + j
-                w.writerow(
-                    [
-                        "\\N",
-                        file_id_base + (i - 1) % distinct_file_ids,
-                        _content_line(i, rng),
-                        _emb_literal(mat[j]),
-                        (i - 1) % page_num_mod + 1,
-                        _meta_obj(i, rng),
-                    ]
-                )
-            written += b
-            if written % progress_every < batch_size:
-                print(f"  wrote {written} rows...", file=sys.stderr, flush=True)
+
+        for pi, path in enumerate(paths):
+            file_skip = skip_rows if pi == 0 else 0
+            file_max = max_rows if pi == 0 and max_rows is not None else None
+            print(f"  [{pi + 1}/{len(paths)}] {path}", file=sys.stderr, flush=True)
+            for _first_idx_in_file, mat in _iter_fbin_batches(
+                path, batch_size, file_skip, file_max
+            ):
+                b = mat.shape[0]
+                for j in range(b):
+                    i = global_i + j
+                    w.writerow(
+                        [
+                            "\\N",
+                            file_id_base + (i - 1) % distinct_file_ids,
+                            _content_line(i, rng),
+                            _emb_literal(mat[j]),
+                            (i - 1) % page_num_mod + 1,
+                            _meta_obj(i, rng),
+                        ]
+                    )
+                global_i += b
+                written += b
+                if written % progress_every < batch_size:
+                    print(f"  wrote {written} rows...", file=sys.stderr, flush=True)
 
     os.replace(tmp, output_file)
     st = os.stat(output_file)
@@ -241,7 +258,11 @@ def main() -> int:
         epilog=__doc__,
     )
     src = ap.add_mutually_exclusive_group(required=True)
-    src.add_argument("--fbin", help="输入 .fbin 路径（cuVS/RAFT 格式）")
+    src.add_argument(
+        "--fbin",
+        nargs="+",
+        help="输入 .fbin 路径，可指定多个（cuVS/RAFT 格式，按顺序拼接为单个 CSV）",
+    )
     src.add_argument("--csv", help="已有 CSV 路径（跳过生成，直接 --load）")
 
     ap.add_argument("-o", "--output", help="输出 CSV 路径（与 --fbin 搭配）")
