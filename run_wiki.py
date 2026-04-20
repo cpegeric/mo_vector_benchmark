@@ -49,6 +49,7 @@ from run_vector_test import (  # noqa: E402
     run_wiki_create_table,
     run_wiki_import,
 )
+from gen import load_csv_into_matrixone  # noqa: E402
 
 
 def build_args(cli) -> SimpleNamespace:
@@ -70,6 +71,7 @@ def build_args(cli) -> SimpleNamespace:
     # 4) 导入步骤需要的字段
     dataset = cfg.get("dataset", {}) or {}
     ns.fbin = dataset.get("base_fbin")
+    ns.csv = cli.csv
     ns.batch_size = cli.batch_size
     ns.file_id_base = cli.file_id_base
 
@@ -99,12 +101,17 @@ def _validate_paths(ns: SimpleNamespace, cli) -> int:
     ds = cfg.get("dataset", {}) or {}
 
     if not cli.skip_import:
-        if not ns.fbin:
-            print("错误: JSON 的 dataset.base_fbin 未设置，且未加 --skip-import。")
-            return 1
-        if not os.path.exists(ns.fbin):
-            print(f"错误: base_fbin 文件不存在: {ns.fbin}")
-            return 1
+        if cli.csv:
+            if not os.path.exists(cli.csv):
+                print(f"错误: --csv 文件不存在: {cli.csv}")
+                return 1
+        else:
+            if not ns.fbin:
+                print("错误: JSON 的 dataset.base_fbin 未设置，且未加 --skip-import / --csv。")
+                return 1
+            if not os.path.exists(ns.fbin):
+                print(f"错误: base_fbin 文件不存在: {ns.fbin}")
+                return 1
 
     # 评估步骤总是会跑，校验 query / groundtruth 路径
     qf = ds.get("query_fbin")
@@ -150,6 +157,11 @@ def main() -> int:
     parser.add_argument("--skip-create-index", action="store_true", help="跳过步骤 3：创建索引")
     parser.add_argument("--batch-size", type=int, default=20000, help="导入批量大小（默认: 20000）")
     parser.add_argument("--file-id-base", type=int, default=20000000, help="file_id 起始值（默认: 20000000）")
+    parser.add_argument(
+        "--csv",
+        default=None,
+        help="使用 LOAD DATA LOCAL INFILE 从 CSV 导入（替代 .fbin INSERT 路径）。CSV 应为 gen.py 生成的 6 列格式。",
+    )
 
     cli = parser.parse_args()
     ns = build_args(cli)
@@ -174,8 +186,23 @@ def main() -> int:
         print("[run_wiki] 跳过 1/4 create-table")
 
     if not cli.skip_import:
-        if _run_step("2/4  import", run_wiki_import):
-            return 1
+        if cli.csv:
+            def _import_via_csv(ns_):
+                load_csv_into_matrixone(
+                    csv_path=cli.csv,
+                    host=ns_.host,
+                    port=ns_.port,
+                    user=ns_.user,
+                    password=ns_.password,
+                    database=ns_.database,
+                    table=ns_.table,
+                )
+                return 0
+            if _run_step("2/4  import (csv LOAD DATA)", _import_via_csv):
+                return 1
+        else:
+            if _run_step("2/4  import", run_wiki_import):
+                return 1
     else:
         print("[run_wiki] 跳过 2/4 import")
 
