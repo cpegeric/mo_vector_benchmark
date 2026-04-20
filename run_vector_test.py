@@ -50,8 +50,9 @@ Wiki-all 向量数据集测试工具
   # 一键完整流程（自动创建表、导入数据、创建索引）
   python run_vector_test.py wiki setup --fbin /path/to/wiki_all_1M.fbin --ivf-lists 100
 
-  # 更简洁的一键入口（从 JSON dataset 块读取 base/query/groundtruth 路径）
-  python run_wiki.py --config cfg/cagra.json -n 1000 -k 10 --concurrency 4
+  # 更简洁的子命令入口（从 JSON dataset 块读取 base/query/groundtruth 路径）
+  python run_wiki.py all --config cfg/cagra.json -n 1000 -k 10 --concurrency 4
+  # 其他子命令：create_table / import / create_index / drop_index / gen_csv / recall
 
 数据集信息:
   名称: cuVS Bench Wiki-all

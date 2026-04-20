@@ -108,6 +108,55 @@ python run_vector_test.py --host 192.168.1.100 --database mydb wiki setup \
 **注意**：`--fbin` 参数只需指定一次，工具会自动完成创建表、导入数据、创建索引三个步骤。如果只需要执行其中某一步，可使用 `--create-table` 或 `--create-index` 参数。
 **注意**：wiki setup 导入wiki_all采用批量加载方式，时间相对较长，如果想要快速加载数据，也可以手动用load data s3的方式加载更快,联系我获取csv s3 path
 
+#### 3.1 子命令入口 `run_wiki.py`（推荐）
+
+`run_wiki.py` 是基于 JSON 配置 (`cfg/*.json`) 的子命令入口，从 `dataset` 块读取 `base_fbin` / `query_fbin` / `groundtruth_ibin` 路径，无需每次重复传 `--fbin` 等参数。
+
+```
+python run_wiki.py <command> --config cfg/xxx.json [options]
+```
+
+| 命令 | 说明 |
+|------|------|
+| `all` | 顺序执行 create_table → import → create_index → recall |
+| `create_table` | 仅创建表 |
+| `import` | 仅导入数据；默认走 `.fbin` INSERT，加 `--csv PATH` 改走 LOAD DATA LOCAL INFILE（显著更快） |
+| `create_index` | 仅创建向量索引（读取 `cfg.index` 与 `cfg.env`） |
+| `drop_index` | 删除索引（索引名取自 `cfg.index.name`，同时尝试清理旧名 `idx_embedding`） |
+| `gen_csv` | 将 `dataset.base_fbin` 转为 6 列 CSV（LOAD DATA 兼容），不连库 |
+| `recall` | 仅跑召回评估（自动把 `cfg.env.probe_limit` 设置到查询 session） |
+
+**典型用法**
+
+```bash
+# 全流程（INSERT 导入）
+python run_wiki.py all --config cfg/ivfpq_1M.json -n 5000 -k 100 --concurrency 32
+
+# 先生成 CSV，再用 LOAD DATA 走全流程（百万级数据导入从分钟级降到秒级）
+python run_wiki.py gen_csv --config cfg/ivfpq_1M.json --output /tmp/wiki_1M.csv
+python run_wiki.py all --config cfg/ivfpq_1M.json --csv /tmp/wiki_1M.csv \
+    -n 5000 -k 100 --concurrency 32
+
+# 迭代索引调参：只重建索引 + 重跑召回
+python run_wiki.py drop_index   --config cfg/ivfpq_1M.json
+python run_wiki.py create_index --config cfg/ivfpq_1M.json
+python run_wiki.py recall       --config cfg/ivfpq_1M.json -n 5000 -k 100 --concurrency 32
+```
+
+**常用参数**
+
+| 参数 | 适用命令 | 说明 |
+|------|---------|------|
+| `--config` | 全部 | JSON 配置文件路径（必填） |
+| `--csv` | `all` / `import` | 走 LOAD DATA 路径的 CSV 文件（由 `gen_csv` 生成） |
+| `-n` / `-k` / `--concurrency` / `--sql-mode` | `all` / `recall` | 召回评估参数 |
+| `-o, --output` | `gen_csv` | 输出 CSV 路径（必填） |
+| `--expected-dim` | `gen_csv` | 期望向量维度（默认 768） |
+| `--batch-size` | `all` / `import` | INSERT 批量大小（默认 20000） |
+| `--file-id-base` / `--distinct-file-ids` | `all` / `import` / `gen_csv` | file_id 生成规则 |
+
+> `run_wiki.py` 会自动从 `cfg.env.probe_limit` 设置 IVF 查询的 probe 参数，无需手动传 `--probe`，与 `vector_benchmark/gtrecall.py` 的默认行为一致。
+
 表结构：
 
 ```sql
