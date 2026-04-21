@@ -6,7 +6,7 @@ import pickle
 import struct
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
+from threading import Lock, local as _thread_local_cls
 from typing import Any, List, Optional, Tuple
 
 import pymysql
@@ -89,7 +89,7 @@ def _init_sql_mode_templates() -> Tuple[str, str, str]:
     lim = S3_L2_DISTANCE_MAX
     m1 = (
         f"SELECT `file_id`,`id` FROM {s1} "
-        f"ORDER BY l2_distance({ec}, %s) DESC LIMIT %s"
+        f"ORDER BY l2_distance({ec}, %s) ASC LIMIT %s"
     )
     m2 = (
         f"SELECT `file_id`, `id`, l2_distance({ec}, %s) AS dist "
@@ -140,6 +140,54 @@ NUM_QUERIES = 10000   # 默认抽样/评测条数；与 --duration 同时用时�
 
 def get_conn():
     return pymysql.connect(**DB_CONFIG)
+
+
+# 会话级 env：每次新建 connection 时 SET key=value（镜像 vector_benchmark/db.py:set_env）
+_SESSION_ENV: dict = {}
+
+
+def set_session_env(env: dict) -> None:
+    """供启动阶段注入 cfg.env；后续每个 thread conn 都会应用。"""
+    global _SESSION_ENV
+    _SESSION_ENV = dict(env or {})
+
+
+_SESSION_ENV_LOG_LOCK = Lock()
+_SESSION_ENV_LOG_CLAIMED = False
+
+
+def _apply_session_env(conn) -> None:
+    """每个 worker 连接都应用一次；只有第一个进入的 worker（thread 0）负责打印。"""
+    global _SESSION_ENV_LOG_CLAIMED
+    if not _SESSION_ENV:
+        return
+    # 原子抢占打印权：第一个 worker 拿到 is_thread0=True，其余 False
+    with _SESSION_ENV_LOG_LOCK:
+        is_thread0 = not _SESSION_ENV_LOG_CLAIMED
+        if is_thread0:
+            _SESSION_ENV_LOG_CLAIMED = True
+    with conn.cursor() as cur:
+        for k, v in _SESSION_ENV.items():
+            sql = f"SET {k} = '{v}'" if isinstance(v, str) else f"SET {k} = {v}"
+            try:
+                cur.execute(sql)
+                if is_thread0:
+                    print(f"  [env] {sql}")
+            except Exception as e:
+                print(f"  [env] 警告: {sql} 失败: {e}")
+
+
+# 线程级连接缓存：用于 precomputed-GT 召回路径，避免每条查询都新建连接
+_tls_conn = _thread_local_cls()
+
+
+def get_thread_conn():
+    c = getattr(_tls_conn, "conn", None)
+    if c is None:
+        c = get_conn()
+        _apply_session_env(c)
+        _tls_conn.conn = c
+    return c
 
 
 def row_to_eval_id(row: Tuple) -> str:
@@ -691,6 +739,87 @@ def read_ivecs(path: str) -> List[List[int]]:
     return neighbors
 
 
+# ===== cuVS / RAFT fbin / ibin 读取（用于 wiki_all 外部 ground truth）=====
+#
+# 格式（小端）：
+#   .fbin                 : uint32 n, uint32 dim,       n*dim   float32 （行主序）
+#   .neighbors.ibin       : uint32 n, uint32 k,         n*k     int32   （0-based 下标）
+# 与 ann-benchmarks 的 fvecs/ivecs 不同：前者每条向量重复写 dim，后者只有一个头。
+
+
+def _read_xbin_header(path: str) -> Tuple[int, int]:
+    with open(path, "rb") as f:
+        hdr = f.read(8)
+    if len(hdr) != 8:
+        raise ValueError(f"文件头过短（<8 字节）: {path}")
+    n, d = struct.unpack("<II", hdr)
+    return int(n), int(d)
+
+
+def load_file_based_queries(
+    fbin_path: str, num_queries: int
+) -> List[List[float]]:
+    """
+    读取 cuVS query.fbin 的前 num_queries 条向量，返回 float 列表的列表（shape: N×d）。
+    调用方把 list[float] 交给 normalize_vec_param() 转成 "[v1,v2,...]" 字面量后入 SQL。
+    """
+    n_total, d = _read_xbin_header(fbin_path)
+    take = min(num_queries, n_total) if num_queries and num_queries > 0 else n_total
+    vectors: List[List[float]] = []
+    with open(fbin_path, "rb") as f:
+        f.seek(8)  # 跳过头
+        remaining = take
+        # 分块读取以避免一次性大内存分配
+        batch = 1024
+        while remaining > 0:
+            b = min(batch, remaining)
+            nbytes = b * d * 4
+            raw = f.read(nbytes)
+            if len(raw) != nbytes:
+                raise ValueError(
+                    f"{fbin_path} 截断：期望 {nbytes} 字节，读到 {len(raw)}"
+                )
+            floats = struct.unpack(f"<{b * d}f", raw)
+            for i in range(b):
+                vectors.append(list(floats[i * d : (i + 1) * d]))
+            remaining -= b
+    print(f"loaded {len(vectors)} queries (dim={d}) from {fbin_path}")
+    return vectors
+
+
+def load_file_based_ground_truth(
+    ibin_path: str, num_queries: int, k: int, id_offset: int
+) -> List[List[str]]:
+    """
+    读取 cuVS groundtruth.neighbors.ibin 前 num_queries 行、前 k 列的邻居下标，
+    把每个 0-based 下标 `i` 映射成 DB id 字符串 `str(i + id_offset)`。
+    """
+    n_total, k_file = _read_xbin_header(ibin_path)
+    if k_file < k:
+        raise ValueError(
+            f"{ibin_path} 的 k={k_file} 小于请求的 k={k}"
+        )
+    take = min(num_queries, n_total) if num_queries and num_queries > 0 else n_total
+    gt: List[List[str]] = []
+    with open(ibin_path, "rb") as f:
+        f.seek(8)  # 跳过头
+        # 每行 k_file 个 int32；只取前 k 列，但必须读完整行以保持对齐
+        row_bytes = k_file * 4
+        for _ in range(take):
+            raw = f.read(row_bytes)
+            if len(raw) != row_bytes:
+                raise ValueError(
+                    f"{ibin_path} 截断：期望 {row_bytes} 字节，读到 {len(raw)}"
+                )
+            ints = struct.unpack(f"<{k_file}i", raw)
+            gt.append([str(ints[j] + id_offset) for j in range(k)])
+    print(
+        f"loaded {len(gt)} ground truth rows (k={k}, file_k={k_file}, "
+        f"id_offset={id_offset}) from {ibin_path}"
+    )
+    return gt
+
+
 def load_id_mapping(path: str) -> List[str]:
     """
     加载 id_mapping 文件（格式：idx\\trow_id），row_id 通常为 file_id\\tid。
@@ -935,22 +1064,21 @@ def evaluate_single_query_with_precomputed_gt(
     - 与提供的 gt_ids 做召回率计算
     返回 (recall, gt_ids, vec_literal, latency_sec)。
     """
-    conn = get_conn()
-    try:
-        t0 = time.perf_counter()
-        res = get_index_result_ids(
-            conn,
-            vec_literal,
-            k,
-            mode_int,
-            filter_val=filter_val,
-            filter_mode=filter_mode,
-        )
-        latency = time.perf_counter() - t0
-        r = recall_at_k(gt_ids, res, k)
-        return r, gt_ids, vec_literal, latency
-    finally:
-        conn.close()
+    conn = get_thread_conn()
+    t0 = time.perf_counter()
+    res = get_index_result_ids(
+        conn,
+        vec_literal,
+        k,
+        mode_int,
+        filter_val=filter_val,
+        filter_mode=filter_mode,
+    )
+    latency = time.perf_counter() - t0
+    # wiki_all 文件 GT（.ibin）只含 id；此处剥离 SQL 结果里的 "file_id\\t" 前缀
+    res_ids_only = [r.split("\t")[-1] for r in res]
+    r = recall_at_k(gt_ids, res_ids_only, k)
+    return r, gt_ids, vec_literal, latency
 
 
 def recall_at_k(gt_ids: List[str], res_ids: List[str], k: int) -> float:
@@ -1218,6 +1346,9 @@ def evaluate(
     ann_max_distinct_file_ids: int = 50,
     probe: Optional[int] = None,
     filter_mode: Optional[str] = None,
+    query_fbin_path: Optional[str] = None,
+    groundtruth_ibin_path: Optional[str] = None,
+    id_offset: int = 1,
 ):
     if database:
         DB_CONFIG["database"] = database
@@ -1307,7 +1438,41 @@ def evaluate(
     if ann_distribute_file_ids and mode_int == 1:
         print("提示: --ann-distribute-file-ids 仅适用于 l2_filter / l2_filter_threshold，S1 已忽略该选项。")
 
-    if query_fvecs_path and groundtruth_ivecs_path and id_mapping_path:
+    # cuVS .fbin/.ibin 直读路径（wiki_all ground truth，免 id_mapping，只适用于 l2_only）
+    if query_fbin_path and groundtruth_ibin_path:
+        if mode_int != 1:
+            print(
+                f"警告: --query-fbin/--groundtruth-ibin 的 cuVS ground truth 是无过滤 L2，"
+                f"不适用于 mode={mode}（仅 l2_only 有意义）。改走 DB 抽样 + 实时 GT 路径。"
+            )
+            # 清空让控制流走默认分支
+            query_fbin_path = None
+            groundtruth_ibin_path = None
+
+    if query_fbin_path and groundtruth_ibin_path:
+        print(
+            f"loading queries from {query_fbin_path} and ground truth from "
+            f"{groundtruth_ibin_path} (id_offset={id_offset})..."
+        )
+        load_n = num_queries if num_queries and num_queries > 0 else 0
+        query_vectors = load_file_based_queries(query_fbin_path, load_n)
+        precomputed_gt_ids = load_file_based_ground_truth(
+            groundtruth_ibin_path, load_n, k, id_offset
+        )
+        total = min(len(query_vectors), len(precomputed_gt_ids))
+        if not duration and num_queries and num_queries > 0:
+            total = min(total, num_queries)
+        query_vectors = query_vectors[:total]
+        precomputed_gt_ids = precomputed_gt_ids[:total]
+        if not query_vectors or not precomputed_gt_ids:
+            print("ERROR: 加载的 query/ground truth 为空，退出。")
+            return
+        query_vecs = query_vectors
+        print(
+            f"loaded {len(query_vecs)} queries and corresponding ground truth "
+            f"from cuVS fbin/ibin."
+        )
+    elif query_fvecs_path and groundtruth_ivecs_path and id_mapping_path:
         if ann_distribute_file_ids:
             print(
                 "提示: 已指定 --query-fvecs 等文件，--ann-distribute-file-ids 不参与加载（vectors/filters 来自文件）。"
@@ -1795,11 +1960,35 @@ def parse_args() -> argparse.Namespace:
         help="设置 probe_limit 值（用于 IVF 索引查询）",
     )
     parser.add_argument(
+        "--session-env-json",
+        type=str,
+        default=None,
+        help="JSON 字典：每个新建 DB 连接都会 SET key=value（供 cagra 等索引的 experimental_* env）",
+    )
+    parser.add_argument(
         "--filter-mode",
         type=str,
         default=None,
         choices=["pre", "post", "force"],
         help="SQL 后缀模式：pre（预过滤）、post（后过滤）、force（强制精确搜索）",
+    )
+    parser.add_argument(
+        "--query-fbin",
+        type=str,
+        default=None,
+        help="cuVS query.fbin 路径（<II>头 + n*dim float32）。与 --groundtruth-ibin 配对；仅 l2_only 生效",
+    )
+    parser.add_argument(
+        "--groundtruth-ibin",
+        type=str,
+        default=None,
+        help="cuVS groundtruth.neighbors.ibin 路径（<II>头 + n*k int32，0-based）",
+    )
+    parser.add_argument(
+        "--id-offset",
+        type=int,
+        default=1,
+        help="fbin 0-based 下标 i 映射到 DB id = i + id_offset；AUTO_INCREMENT 从 1 起时取默认 1",
     )
     return parser.parse_args()
 
@@ -1811,6 +2000,12 @@ if __name__ == "__main__":
         TABLE_NAME = args.table
         # 刷新 SQL 模板
         refresh_sql_mode_templates()
+    # 会话级 env（供 cagra 等需要 experimental_cagra_index=1 的索引）
+    if args.session_env_json:
+        try:
+            set_session_env(json.loads(args.session_env_json))
+        except Exception as e:
+            print(f"[env] 警告: --session-env-json 解析失败: {e}")
     evaluate(
         num_queries=args.num_queries,
         k=args.k,
@@ -1830,5 +2025,8 @@ if __name__ == "__main__":
         ann_max_distinct_file_ids=args.ann_max_distinct_file_ids,
         probe=args.probe,
         filter_mode=args.filter_mode,
+        query_fbin_path=args.query_fbin,
+        groundtruth_ibin_path=args.groundtruth_ibin,
+        id_offset=args.id_offset,
     )
 

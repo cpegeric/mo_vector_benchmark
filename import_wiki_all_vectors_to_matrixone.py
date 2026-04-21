@@ -105,7 +105,12 @@ def _iter_fbin_batches(
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Wiki-all .fbin 向量导入 MatrixOne historical_file_blocks 类表")
-    ap.add_argument("--fbin", required=True, help="向量库 .fbin 路径")
+    ap.add_argument(
+        "--fbin",
+        required=True,
+        nargs="+",
+        help="向量库 .fbin 路径，可指定多个（按顺序顺延全局行号 i）",
+    )
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=6001)
     ap.add_argument("--user", default="dump")
@@ -121,13 +126,17 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
-    n_file, d_file = _read_fbin_header(args.fbin)
-    if d_file != args.expected_dim:
-        print(
-            f"错误: 文件 dim={d_file} 与 --expected-dim={args.expected_dim} 不一致",
-            file=sys.stderr,
-        )
-        sys.exit(2)
+    totals = []
+    for p in args.fbin:
+        n, d = _read_fbin_header(p)
+        if d != args.expected_dim:
+            print(
+                f"错误: 文件 {p} dim={d} 与 --expected-dim={args.expected_dim} 不一致",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        totals.append(n)
+    n_total = sum(totals)
 
     rng = np.random.default_rng(args.seed)
 
@@ -150,34 +159,48 @@ def main() -> None:
     )
 
     total_done = 0
+    global_i = 1  # 跨文件的 1-based 全局行号
     try:
         with conn.cursor() as cur:
-            for first_i, mat in _iter_fbin_batches(
-                args.fbin, args.batch_size, args.skip_rows, args.max_rows
-            ):
-                b, d = mat.shape
-                if d != args.expected_dim:
-                    raise RuntimeError("batch 维度与头不一致")
-                batch = []
-                for j in range(b):
-                    i = first_i + j
-                    vec = mat[j]
-                    emb_str = _emb_literal_from_vec(vec)
-                    fid = args.file_id_base + (i - 1) % DISTINCT_FILE_IDS
-                    pnum = (i - 1) % args.page_num_mod + 1
-                    batch.append(
-                        (
-                            fid,
-                            _content_line(i, rng),
-                            emb_str,
-                            pnum,
-                            _meta_obj(i, rng),
+            for pi, path in enumerate(args.fbin):
+                file_skip = args.skip_rows if pi == 0 else 0
+                file_max = args.max_rows if pi == 0 and args.max_rows is not None else None
+                print(
+                    f"  [{pi + 1}/{len(args.fbin)}] {path}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                for _first_idx_in_file, mat in _iter_fbin_batches(
+                    path, args.batch_size, file_skip, file_max
+                ):
+                    b, d = mat.shape
+                    if d != args.expected_dim:
+                        raise RuntimeError("batch 维度与头不一致")
+                    batch = []
+                    for j in range(b):
+                        i = global_i + j
+                        vec = mat[j]
+                        emb_str = _emb_literal_from_vec(vec)
+                        fid = args.file_id_base + (i - 1) % DISTINCT_FILE_IDS
+                        pnum = (i - 1) % args.page_num_mod + 1
+                        batch.append(
+                            (
+                                fid,
+                                _content_line(i, rng),
+                                emb_str,
+                                pnum,
+                                _meta_obj(i, rng),
+                            )
                         )
+                    cur.executemany(sql, batch)
+                    conn.commit()
+                    global_i += b
+                    total_done += b
+                    print(
+                        f"  imported {total_done} / total_vectors={n_total}",
+                        file=sys.stderr,
+                        flush=True,
                     )
-                cur.executemany(sql, batch)
-                conn.commit()
-                total_done += b
-                print(f"  imported {total_done} / file_vectors={n_file}", file=sys.stderr, flush=True)
     finally:
         conn.close()
 

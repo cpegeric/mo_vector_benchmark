@@ -8,7 +8,7 @@ Wiki-all 向量数据集测试工具
   wiki info              - 显示 Wiki 数据集信息
   wiki create-table      - 创建 historical_file_blocks_wiki 表
   wiki import --fbin <path>  - 导入 .fbin 向量数据
-  wiki create-index      - 创建向量索引
+  wiki create-index      - 创建向量索引（支持 JSON 配置驱动 cagra/ivfpq/ivfflat/hnsw）
   wiki test              - 运行搜索测试
   wiki setup             - 一键设置（创建表+导入+建索引+测试）
   ann                    - 生成 ANN 评测文件
@@ -24,8 +24,13 @@ Wiki-all 向量数据集测试工具
   # 导入 .fbin 数据
   python run_vector_test.py wiki import --fbin /path/to/wiki_all_1M.fbin
 
-  # 创建向量索引
+  # 创建向量索引（旧用法：只支持 IVFFLAT）
   python run_vector_test.py wiki create-index --ivf-lists 100
+
+  # 使用 JSON 配置创建索引（支持 cagra / ivfpq / ivfflat / hnsw；env 变量自动 SET）
+  python run_vector_test.py --config cfg/cagra.json wiki create-index
+  python run_vector_test.py --config cfg/ivfpq.json wiki create-index
+  python run_vector_test.py --config cfg/hnsw.json  wiki create-index
 
   # 运行测试
   python run_vector_test.py wiki test -n 1000 -k 10 --concurrency 4
@@ -33,11 +38,21 @@ Wiki-all 向量数据集测试工具
   # 生成 ANN 文件
   python run_vector_test.py ann --sql-mode l2_only -n 1000 -k 10
 
-  # 运行评估
+  # 运行评估（DB 抽样 + 在线 ground truth）
   python run_vector_test.py run --sql-mode l2_filter --filter-val 20000000 -n 1000 -k 10 --concurrency 100
+
+  # 使用 cuVS 预计算 ground truth（query.fbin + groundtruth.neighbors.ibin，仅 l2_only）
+  python run_vector_test.py --config cfg/cagra.json run \\
+    --sql-mode l2_only -n 1000 -k 10 \\
+    --query-fbin /path/to/queries.fbin \\
+    --groundtruth-ibin /path/to/groundtruth.neighbors.ibin
 
   # 一键完整流程（自动创建表、导入数据、创建索引）
   python run_vector_test.py wiki setup --fbin /path/to/wiki_all_1M.fbin --ivf-lists 100
+
+  # 更简洁的子命令入口（从 JSON dataset 块读取 base/query/groundtruth 路径）
+  python run_wiki.py all --config cfg/cagra.json -n 1000 -k 10 --concurrency 4
+  # 其他子命令：create_table / import / create_index / drop_index / gen_csv / recall
 
 数据集信息:
   名称: cuVS Bench Wiki-all
@@ -80,6 +95,95 @@ def load_sql_config(config_path: str = None) -> dict:
         return {}
     with open(path, 'r', encoding='utf-8') as f:
         return json.load(f)
+
+
+# ===== JSON 索引配置支持（cagra / ivfpq / ivfflat / hnsw）=====
+
+# argparse 全局默认值，用于判断 CLI 是否被显式指定
+_ARG_DEFAULTS = {
+    "host": "127.0.0.1",
+    "port": 6001,
+    "user": "dump",
+    "password": "111",
+    "database": "jst_app_wiki",
+    "table": "historical_file_blocks_wiki",
+}
+
+
+def load_index_config(path: Optional[str]) -> Optional[dict]:
+    """加载索引 JSON 配置（类似 vector_benchmark/cfg/cagra.json 的结构）"""
+    if not path:
+        return None
+    if not os.path.exists(path):
+        print(f"错误: 配置文件不存在: {path}")
+        sys.exit(2)
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def apply_config_to_args(args, cfg: dict) -> None:
+    """把 JSON 的连接参数合并到 args；仅在 CLI 值仍为默认时覆盖。"""
+    for key, default_val in _ARG_DEFAULTS.items():
+        if key in cfg and getattr(args, key, None) == default_val:
+            setattr(args, key, cfg[key])
+
+
+def apply_env(cursor, cfg: dict) -> None:
+    """把 cfg['env'] 中的变量应用到当前会话（SET k = v）。"""
+    env = cfg.get("env", {}) or {}
+    for k, v in env.items():
+        sql = f"SET {k} = {v}"
+        print(f"  执行: {sql}")
+        cursor.execute(sql)
+
+
+def build_create_index_sql(table: str, index_cfg: dict) -> str:
+    """根据 index 配置构造 CREATE INDEX SQL。支持 cagra / ivfpq / ivfflat / hnsw。"""
+    idx_name = index_cfg.get("name", "idx_l2")
+    idx_type = (index_cfg.get("type") or "ivfflat").lower()
+    dist = index_cfg.get("op_type", "vector_l2_ops")
+
+    if idx_type == "ivfflat":
+        lists = index_cfg.get("lists", 1000)
+        return (
+            f'CREATE INDEX {idx_name} USING ivfflat ON `{table}`(embedding) '
+            f'lists={lists} op_type "{dist}"'
+        )
+    if idx_type == "hnsw":
+        m = index_cfg.get("m", 100)
+        ef_c = index_cfg.get("ef_construction", 400)
+        ef_s = index_cfg.get("ef_search", 200)
+        return (
+            f'CREATE INDEX {idx_name} USING hnsw ON `{table}`(embedding) '
+            f'm={m} ef_construction={ef_c} ef_search={ef_s} op_type "{dist}"'
+        )
+    if idx_type == "cagra":
+        dm = index_cfg.get("distribution_mode", "single")
+        q = index_cfg.get("quantization", "float32")
+        igd = index_cfg.get("intermediate_graph_degree", 128)
+        gd = index_cfg.get("graph_degree", 64)
+        itopk = index_cfg.get("itopk_size", 64)
+        return (
+            f'CREATE INDEX {idx_name} USING cagra ON `{table}`(embedding) '
+            f'distribution_mode "{dm}" quantization "{q}" '
+            f'intermediate_graph_degree={igd} graph_degree={gd} '
+            f'itopk_size={itopk} op_type "{dist}"'
+        )
+    if idx_type == "ivfpq":
+        lists = index_cfg.get("lists", 1024)
+        bits_per_code = index_cfg.get("bits_per_code", 8)
+        m = index_cfg.get("m", 4)
+        q = index_cfg.get("quantization", "float32")
+        dm = index_cfg.get("distribution_mode", "single")
+        return (
+            f'CREATE INDEX {idx_name} USING ivfpq ON `{table}`(embedding) '
+            f"LISTS {lists} BITS_PER_CODE {bits_per_code} M {m} "
+            f"OP_TYPE '{dist}' QUANTIZATION '{q}' "
+            f"DISTRIBUTION_MODE '{dm}'"
+        )
+    raise ValueError(
+        f"未知索引类型: {idx_type}（支持 cagra / ivfpq / ivfflat / hnsw）"
+    )
 
 
 def run_wiki_info():
@@ -179,9 +283,11 @@ def run_wiki_import(args):
         print("错误: 请指定 --fbin 参数提供 .fbin 文件路径")
         return 1
 
-    if not os.path.exists(args.fbin):
-        print(f"错误: .fbin 文件不存在: {args.fbin}")
-        return 1
+    fbin_list = [args.fbin] if isinstance(args.fbin, str) else list(args.fbin)
+    for p in fbin_list:
+        if not os.path.exists(p):
+            print(f"错误: .fbin 文件不存在: {p}")
+            return 1
 
     cmd = [
         "python3",
@@ -192,9 +298,9 @@ def run_wiki_import(args):
         "--password", str(args.password),
         "--database", str(args.database),
         "--table", str(args.table),
-        "--fbin", str(args.fbin),
         "--batch-size", str(args.batch_size),
         "--file-id-base", str(args.file_id_base),
+        "--fbin", *fbin_list,
     ]
 
     print(f"运行: {' '.join(cmd)}")
@@ -203,12 +309,18 @@ def run_wiki_import(args):
 
 
 def run_wiki_create_index(args):
-    """创建 Wiki 向量索引"""
+    """创建 Wiki 向量索引。
+
+    若 --config 指定了 JSON 配置，则使用其中的 index/env 块驱动索引创建
+    （支持 cagra / ivfpq / ivfflat / hnsw）；否则沿用旧的 --ivf-lists IVFFLAT 行为。
+    """
     import pymysql
 
     print("=" * 70)
     print("创建 Wiki 向量索引")
     print("=" * 70)
+
+    cfg = getattr(args, "_index_config", None)
 
     try:
         conn = pymysql.connect(
@@ -217,26 +329,55 @@ def run_wiki_create_index(args):
             user=args.user,
             password=args.password,
             database=args.database,
+            autocommit=True,
         )
 
-        # 删除旧索引（如果存在），忽略错误
-        try:
-            drop_idx_sql = f"DROP INDEX IF EXISTS idx_embedding ON `{args.table}`"
+        if cfg:
+            index_cfg = cfg.get("index", {}) or {}
+            idx_name = index_cfg.get("name", "idx_l2")
+
             with conn.cursor() as cur:
-                cur.execute(drop_idx_sql)
-                print("  旧索引已删除（如果存在）")
-        except Exception:
-            # 索引可能不存在，忽略错误继续
-            pass
+                apply_env(cur, cfg)
 
-        # 创建新索引（MatrixOne 格式）
-        ivf_lists = args.ivf_lists
-        create_idx_sql = f'''CREATE INDEX idx_l2 USING ivfflat ON `{args.table}`(embedding) lists={ivf_lists} op_type "vector_l2_ops"'''
-        with conn.cursor() as cur:
-            cur.execute(create_idx_sql)
-            print(f'  向量索引已创建 (IVFFLAT, lists={ivf_lists}, op_type="vector_l2_ops")')
+                drop_sql = f"DROP INDEX IF EXISTS `{idx_name}` ON `{args.table}`"
+                try:
+                    cur.execute(drop_sql)
+                    print(f"  旧索引 `{idx_name}` 已删除（如果存在）")
+                except Exception:
+                    pass
+                # 兼容旧索引名 idx_embedding
+                try:
+                    cur.execute(f"DROP INDEX IF EXISTS idx_embedding ON `{args.table}`")
+                except Exception:
+                    pass
 
-        conn.commit()
+                create_sql = build_create_index_sql(args.table, index_cfg)
+                print(f"  执行: {create_sql}")
+                cur.execute(create_sql)
+                print(
+                    f'  向量索引已创建 (type={index_cfg.get("type")}, '
+                    f'name={idx_name}, op_type={index_cfg.get("op_type", "vector_l2_ops")})'
+                )
+        else:
+            # 旧路径：仅 IVFFLAT，由 --ivf-lists 控制
+            with conn.cursor() as cur:
+                try:
+                    cur.execute(f"DROP INDEX IF EXISTS idx_embedding ON `{args.table}`")
+                    print("  旧索引已删除（如果存在）")
+                except Exception:
+                    pass
+
+                ivf_lists = args.ivf_lists
+                create_idx_sql = (
+                    f'CREATE INDEX idx_l2 USING ivfflat ON `{args.table}`(embedding) '
+                    f'lists={ivf_lists} op_type "vector_l2_ops"'
+                )
+                cur.execute(create_idx_sql)
+                print(
+                    f'  向量索引已创建 (IVFFLAT, lists={ivf_lists}, '
+                    f'op_type="vector_l2_ops")'
+                )
+
         conn.close()
         print("完成!")
         return 0
@@ -356,9 +497,34 @@ def run_eval(args):
     if hasattr(args, 'probe') and args.probe is not None:
         cmd.extend(["--probe", str(args.probe)])
 
+    # 会话级 env：把 cfg.env 整体透传给 eval（每个 worker 连接都会 SET key=value）
+    _cfg_for_env = getattr(args, "_index_config", None) or {}
+    _env_for_session = _cfg_for_env.get("env") or {}
+    if _env_for_session:
+        cmd.extend(["--session-env-json", json.dumps(_env_for_session)])
+
     # filter_mode 设置
     if hasattr(args, 'filter_mode') and args.filter_mode:
         cmd.extend(["--filter-mode", args.filter_mode])
+
+    # 数据集文件（cuVS query.fbin + groundtruth.neighbors.ibin）
+    cfg = getattr(args, "_index_config", None) or {}
+    ds = cfg.get("dataset", {}) or {}
+
+    query_fbin = getattr(args, "query_fbin", None) or ds.get("query_fbin")
+    groundtruth_ibin = getattr(args, "groundtruth_ibin", None) or ds.get("groundtruth_ibin")
+    id_offset = getattr(args, "id_offset", None)
+    if id_offset is None or id_offset == 1:
+        # CLI 仍为默认值时，允许 JSON 覆盖
+        if "id_offset" in ds:
+            id_offset = ds["id_offset"]
+
+    if query_fbin:
+        cmd.extend(["--query-fbin", str(query_fbin)])
+    if groundtruth_ibin:
+        cmd.extend(["--groundtruth-ibin", str(groundtruth_ibin)])
+    if id_offset is not None:
+        cmd.extend(["--id-offset", str(id_offset)])
 
     print(f"执行: {' '.join(cmd)}")
     result = subprocess.run(cmd)
@@ -448,8 +614,11 @@ def main():
   # 导入 .fbin 数据
   python run_vector_test.py wiki import --fbin /path/to/wiki_all_1M.fbin
 
-  # 创建向量索引
+  # 创建向量索引（旧用法）
   python run_vector_test.py wiki create-index --ivf-lists 100
+
+  # 使用 JSON 配置创建索引（支持 cagra / ivfpq / ivfflat / hnsw）
+  python run_vector_test.py --config cfg/cagra.json wiki create-index
 
   # 运行测试
   python run_vector_test.py wiki test -n 1000 -k 10 --concurrency 4
@@ -459,6 +628,12 @@ def main():
 
   # 运行评估
   python run_vector_test.py run --sql-mode l2_filter --filter-val 20000000 -n 1000 -k 10 --concurrency 100
+
+  # 使用 cuVS 预计算 ground truth（免除对每条 query 做暴力 SQL）
+  python run_vector_test.py --config cfg/cagra.json run \\
+    --sql-mode l2_only -n 1000 -k 10 \\
+    --query-fbin /path/to/queries.fbin \\
+    --groundtruth-ibin /path/to/groundtruth.neighbors.ibin
 
   # 一键完整流程（自动创建表、导入数据、创建索引）
   python run_vector_test.py wiki setup --fbin /path/to/wiki_all_1M.fbin --ivf-lists 100
@@ -475,6 +650,10 @@ def main():
     parser.add_argument("--password", default="111", help="密码（默认: 111）")
     parser.add_argument("--database", default="jst_app_wiki", help="数据库名（默认: jst_app_wiki）")
     parser.add_argument("--table", default="historical_file_blocks_wiki", help="表名（默认: historical_file_blocks_wiki）")
+    parser.add_argument(
+        "--config",
+        help="JSON 配置文件（含 index / env / dataset，参见 vector_benchmark/cfg/cagra.json）",
+    )
 
     subparsers = parser.add_subparsers(dest="command", help="可用命令")
 
@@ -547,8 +726,16 @@ def main():
     run_parser.add_argument("--skip-db-verify", action="store_true", help="跳过数据库预检")
     run_parser.add_argument("--probe", type=int, help="设置 probe_limit 值（用于 IVF 索引查询）")
     run_parser.add_argument("--filter-mode", choices=["pre", "post", "force"], help="SQL 后缀模式：pre（预过滤）、post（后过滤）、force（强制精确搜索）")
+    run_parser.add_argument("--query-fbin", help="cuVS 查询向量文件（float32 .fbin）。与 --groundtruth-ibin 同时给出时，l2_only 模式将用文件代替 DB 抽样与暴力 SQL ground truth")
+    run_parser.add_argument("--groundtruth-ibin", help="cuVS ground-truth 近邻文件（.neighbors.ibin）")
+    run_parser.add_argument("--id-offset", type=int, default=1, help="fbin 0-based 索引 i 映射到 DB id = i + id_offset（AUTO_INCREMENT 从 1 开始时默认 1）")
 
     args = parser.parse_args()
+
+    cfg = load_index_config(getattr(args, "config", None))
+    if cfg:
+        apply_config_to_args(args, cfg)
+        args._index_config = cfg
 
     if args.command == "wiki":
         return run_wiki(args)

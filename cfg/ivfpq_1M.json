@@ -1,0 +1,31 @@
+{
+  "host": "127.0.0.1",
+  "port": 6001,
+  "user": "dump",
+  "password": "111",
+  "database": "jst_app_wiki",
+  "table": "historical_file_blocks_wiki",
+  "index": {
+    "name": "idx_l2",
+    "type": "ivfpq",
+    "lists": 1024,
+    "bits_per_code": 8,
+    "m": 192,
+    "quantization": "float32",
+    "op_type": "vector_l2_ops",
+    "distribution_mode": "single"
+  },
+  "dimension": 768,
+  "env": {
+    "probe_limit": 64,
+    "ivfpq_max_index_capacity": 1000000,
+    "ivfpq_batch_window": 1000,
+    "kmeans_train_percent": 10
+  },
+  "dataset": {
+    "base_fbin": ["/home/ubuntu/github/vector_benchmark/wiki_all_1M/base.1M.fbin"],
+    "query_fbin": "/home/ubuntu/github/vector_benchmark/wiki_all_1M/queries.fbin",
+    "groundtruth_ibin": "/home/ubuntu/github/vector_benchmark/wiki_all_1M/groundtruth.1M.neighbors.ibin",
+    "id_offset": 1
+  }
+}
