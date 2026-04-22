@@ -788,22 +788,45 @@ def load_file_based_queries(
 
 
 def load_file_based_ground_truth(
-    ibin_path: str, num_queries: int, k: int, id_offset: int
+    ibin_path: str, num_queries: int, k: int, id_offset: int,
+    filter_val: Optional[int] = None,
+    file_id_base: Optional[int] = None,
+    distinct_file_ids: Optional[int] = None,
 ) -> List[List[str]]:
     """
-    读取 cuVS groundtruth.neighbors.ibin 前 num_queries 行、前 k 列的邻居下标，
+    读取 cuVS groundtruth.neighbors.ibin 前 num_queries 行的邻居下标，
     把每个 0-based 下标 `i` 映射成 DB id 字符串 `str(i + id_offset)`。
+
+    无 filter（默认）：只读前 k 列，返回每行恰好 k 个 id。
+
+    带 filter：读完整的 k_file 列，按
+        file_id = file_id_base + (row_idx - 1) % distinct_file_ids
+    的反推筛出符合 `file_id == filter_val` 的下标（row_idx = raw_idx + 1，
+    raw_idx 即 .ibin 中的 0-based neighbor idx），再映射为 DB id。
+    每行按出现顺序截断至最多 k 个；若不足 k 则只返回实际符合的数量（调用方应以
+    eligible_recall_at_k 处理不足 k 的情况）。
     """
+    filtered = filter_val is not None
+    if filtered:
+        if file_id_base is None or distinct_file_ids is None or distinct_file_ids <= 0:
+            raise ValueError(
+                "load_file_based_ground_truth: filter_val 已设置但 file_id_base/"
+                "distinct_file_ids 缺失或非法"
+            )
+        target_res = (int(filter_val) - int(file_id_base)) % int(distinct_file_ids)
+
     n_total, k_file = _read_xbin_header(ibin_path)
-    if k_file < k:
+    if not filtered and k_file < k:
         raise ValueError(
             f"{ibin_path} 的 k={k_file} 小于请求的 k={k}"
         )
     take = min(num_queries, n_total) if num_queries and num_queries > 0 else n_total
     gt: List[List[str]] = []
+    short_rows = 0
+    empty_rows = 0
+    total_eligible = 0
     with open(ibin_path, "rb") as f:
         f.seek(8)  # 跳过头
-        # 每行 k_file 个 int32；只取前 k 列，但必须读完整行以保持对齐
         row_bytes = k_file * 4
         for _ in range(take):
             raw = f.read(row_bytes)
@@ -812,11 +835,47 @@ def load_file_based_ground_truth(
                     f"{ibin_path} 截断：期望 {row_bytes} 字节，读到 {len(raw)}"
                 )
             ints = struct.unpack(f"<{k_file}i", raw)
-            gt.append([str(ints[j] + id_offset) for j in range(k)])
-    print(
-        f"loaded {len(gt)} ground truth rows (k={k}, file_k={k_file}, "
-        f"id_offset={id_offset}) from {ibin_path}"
-    )
+            if not filtered:
+                gt.append([str(ints[j] + id_offset) for j in range(k)])
+            else:
+                eligible: List[str] = []
+                for raw_idx in ints:
+                    # raw_idx 为 0-based；DB row_idx（1-based）= raw_idx + id_offset；
+                    # 对应 file_id = file_id_base + (row_idx - 1) % distinct_file_ids
+                    if ((raw_idx + id_offset - 1) % distinct_file_ids) == target_res:
+                        eligible.append(str(raw_idx + id_offset))
+                        if len(eligible) >= k:
+                            break
+                total_eligible += len(eligible)
+                if len(eligible) < k:
+                    short_rows += 1
+                if len(eligible) == 0:
+                    empty_rows += 1
+                gt.append(eligible)
+
+    if filtered:
+        avg_eligible = total_eligible / float(len(gt)) if gt else 0.0
+        print(
+            f"loaded {len(gt)} filtered ground truth rows "
+            f"(k={k}, file_k={k_file}, id_offset={id_offset}, filter_val={filter_val}, "
+            f"file_id_base={file_id_base}, distinct_file_ids={distinct_file_ids}) "
+            f"from {ibin_path}; avg eligible GT size={avg_eligible:.2f}"
+        )
+        if short_rows:
+            print(
+                f"  警告: {short_rows}/{len(gt)} 条 query 的可用 GT 不足 k={k}；"
+                f"这些 query 将用 eligible recall denom=min(k, |filtered_gt|)"
+            )
+        if empty_rows:
+            print(
+                f"  注意: {empty_rows}/{len(gt)} 条 query 的 filtered GT 为空"
+                f"（建议加大 k_file，或检查 filter_val 是否与数据 file_id 分布一致）"
+            )
+    else:
+        print(
+            f"loaded {len(gt)} ground truth rows (k={k}, file_k={k_file}, "
+            f"id_offset={id_offset}) from {ibin_path}"
+        )
     return gt
 
 
@@ -1077,7 +1136,7 @@ def evaluate_single_query_with_precomputed_gt(
     latency = time.perf_counter() - t0
     # wiki_all 文件 GT（.ibin）只含 id；此处剥离 SQL 结果里的 "file_id\\t" 前缀
     res_ids_only = [r.split("\t")[-1] for r in res]
-    r = recall_at_k(gt_ids, res_ids_only, k)
+    r = eligible_recall_at_k(gt_ids, res_ids_only, k)
     return r, gt_ids, vec_literal, latency
 
 
@@ -1087,6 +1146,24 @@ def recall_at_k(gt_ids: List[str], res_ids: List[str], k: int) -> float:
     if k == 0:
         return 0.0
     return len(gt_topk & res_topk) / float(k)
+
+
+def eligible_recall_at_k(gt_ids: List[str], res_ids: List[str], k: int) -> float:
+    """
+    Eligible recall@k：召回分母取 min(k, |gt_ids|)，避免当 filtered ground truth
+    的可用邻居少于 k 时分母过大导致无法达到 1.0。
+    - |gt_ids| >= k 时与 recall_at_k 等价。
+    - |gt_ids| < k 时，denom = |gt_ids|，结果表示"可达 GT 的命中比例"。
+    - |gt_ids| == 0 时返回 0.0（该 query 无可评估的 filtered GT，由调用方决定是否纳入平均）。
+    """
+    if k <= 0:
+        return 0.0
+    denom = min(k, len(gt_ids))
+    if denom == 0:
+        return 0.0
+    gt_topk = set(gt_ids[:k])
+    res_topk = set(res_ids[:k])
+    return len(gt_topk & res_topk) / float(denom)
 
 
 # ===== 主评估逻辑 =====
@@ -1349,6 +1426,8 @@ def evaluate(
     query_fbin_path: Optional[str] = None,
     groundtruth_ibin_path: Optional[str] = None,
     id_offset: int = 1,
+    filter_file_id_base: Optional[int] = None,
+    filter_distinct_file_ids: Optional[int] = None,
 ):
     if database:
         DB_CONFIG["database"] = database
@@ -1438,16 +1517,31 @@ def evaluate(
     if ann_distribute_file_ids and mode_int == 1:
         print("提示: --ann-distribute-file-ids 仅适用于 l2_filter / l2_filter_threshold，S1 已忽略该选项。")
 
-    # cuVS .fbin/.ibin 直读路径（wiki_all ground truth，免 id_mapping，只适用于 l2_only）
+    # cuVS .fbin/.ibin 直读路径（wiki_all ground truth，免 id_mapping）
+    # - l2_only：直接取前 k 列；
+    # - l2_filter / l2_filter_threshold：按 mode23_filter + file_id_base/
+    #   distinct_file_ids 在本地把 GT 过滤成 file_id == filter_val 的邻居。
     if query_fbin_path and groundtruth_ibin_path:
-        if mode_int != 1:
+        if mode_int != 1 and ann_distribute_file_ids:
             print(
-                f"警告: --query-fbin/--groundtruth-ibin 的 cuVS ground truth 是无过滤 L2，"
-                f"不适用于 mode={mode}（仅 l2_only 有意义）。改走 DB 抽样 + 实时 GT 路径。"
+                f"警告: --ann-distribute-file-ids 与 --query-fbin/--groundtruth-ibin "
+                f"目前不兼容（多 file_id 需要在线 GT）；改走 DB 抽样 + 实时 GT 路径。"
             )
-            # 清空让控制流走默认分支
             query_fbin_path = None
             groundtruth_ibin_path = None
+        elif mode_int in (2, 3):
+            if mode23_filter is None or str(mode23_filter).strip() == "":
+                print(
+                    f"错误: mode={mode} 使用 --query-fbin/--groundtruth-ibin 需要 "
+                    f"--mode23-filter=<file_id>；未提供则无法本地过滤 GT。"
+                )
+                return
+            if filter_file_id_base is None or filter_distinct_file_ids is None:
+                print(
+                    f"错误: mode={mode} 使用 --query-fbin/--groundtruth-ibin 需要 "
+                    f"--filter-file-id-base 和 --filter-distinct-file-ids（与 gen.py 生成时一致）。"
+                )
+                return
 
     if query_fbin_path and groundtruth_ibin_path:
         print(
@@ -1456,9 +1550,24 @@ def evaluate(
         )
         load_n = num_queries if num_queries and num_queries > 0 else 0
         query_vectors = load_file_based_queries(query_fbin_path, load_n)
-        precomputed_gt_ids = load_file_based_ground_truth(
-            groundtruth_ibin_path, load_n, k, id_offset
-        )
+        if mode_int in (2, 3):
+            try:
+                gt_filter_val = int(mode23_filter)
+            except (TypeError, ValueError):
+                print(
+                    f"错误: --mode23-filter={mode23_filter!r} 不是整数，无法用于本地 GT 过滤。"
+                )
+                return
+            precomputed_gt_ids = load_file_based_ground_truth(
+                groundtruth_ibin_path, load_n, k, id_offset,
+                filter_val=gt_filter_val,
+                file_id_base=filter_file_id_base,
+                distinct_file_ids=filter_distinct_file_ids,
+            )
+        else:
+            precomputed_gt_ids = load_file_based_ground_truth(
+                groundtruth_ibin_path, load_n, k, id_offset
+            )
         total = min(len(query_vectors), len(precomputed_gt_ids))
         if not duration and num_queries and num_queries > 0:
             total = min(total, num_queries)
@@ -1832,10 +1941,28 @@ def evaluate(
     p95_latency_ms = sorted(latencies)[int(len(latencies) * 0.95)] * 1000 if latencies else 0.0
     p99_latency_ms = sorted(latencies)[int(len(latencies) * 0.99)] * 1000 if latencies else 0.0
 
+    used_precomputed_filtered_gt = (
+        precomputed_gt_ids is not None
+        and mode_int in (2, 3)
+        and query_fbin_path
+        and groundtruth_ibin_path
+    )
+
     print("==== Summary ====")
     print(f"queries        = {len(query_vecs)}")
     print(f"concurrency    = {concurrency}")
-    print(f"avg recall@{k} = {avg_recall:.4f}")
+    if used_precomputed_filtered_gt:
+        avg_eligible = (
+            sum(len(g) for g in precomputed_gt_ids) / float(len(precomputed_gt_ids))
+            if precomputed_gt_ids else 0.0
+        )
+        print(
+            f"avg eligible recall@{k} = {avg_recall:.4f} "
+            f"(denom=min(k, |filtered_gt|); filter_val={mode23_filter}, "
+            f"avg filtered GT size={avg_eligible:.2f})"
+        )
+    else:
+        print(f"avg recall@{k} = {avg_recall:.4f}")
     print(f"QPS            = {qps:.2f}")
     print(f"QPM            = {qpm:.2f}")
     print(f"total time    = {total:.2f} s")
@@ -1969,8 +2096,8 @@ def parse_args() -> argparse.Namespace:
         "--filter-mode",
         type=str,
         default=None,
-        choices=["pre", "post", "force"],
-        help="SQL 后缀模式：pre（预过滤）、post（后过滤）、force（强制精确搜索）",
+        choices=["pre", "post", "force", "include"],
+        help="SQL 后缀模式：pre（预过滤）、post（后过滤）、force（强制精确搜索）、include（INCLUDE 列过滤）",
     )
     parser.add_argument(
         "--query-fbin",
@@ -1989,6 +2116,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="fbin 0-based 下标 i 映射到 DB id = i + id_offset；AUTO_INCREMENT 从 1 起时取默认 1",
+    )
+    parser.add_argument(
+        "--filter-file-id-base",
+        type=int,
+        default=None,
+        help="本地过滤 GT 用的 file_id_base（与 gen.py 的 --file-id-base 一致；默认 20000000）",
+    )
+    parser.add_argument(
+        "--filter-distinct-file-ids",
+        type=int,
+        default=None,
+        help="本地过滤 GT 用的 distinct_file_ids（与 gen.py 的 --distinct-file-ids 一致；默认 50）",
     )
     return parser.parse_args()
 
@@ -2028,5 +2167,7 @@ if __name__ == "__main__":
         query_fbin_path=args.query_fbin,
         groundtruth_ibin_path=args.groundtruth_ibin,
         id_offset=args.id_offset,
+        filter_file_id_base=args.filter_file_id_base,
+        filter_distinct_file_ids=args.filter_distinct_file_ids,
     )
 

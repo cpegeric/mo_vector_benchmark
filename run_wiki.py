@@ -98,13 +98,15 @@ def build_args(cli) -> SimpleNamespace:
     ns.num_queries = cli.num_queries
     ns.k = cli.k
     ns.concurrency = cli.concurrency
-    ns.filter_val = None
+    ns.filter_val = cli.filter_val
     ns.duration = None
     ns.distribute_file_ids = False
     ns.max_distinct_file_ids = 50
     ns.skip_db_verify = True
     ns.probe = (cfg.get("env", {}) or {}).get("probe_limit")
-    ns.filter_mode = None
+    ns.filter_mode = cli.filter_mode
+    ns.filter_file_id_base = cli.filter_file_id_base
+    ns.filter_distinct_file_ids = cli.filter_distinct_file_ids
     ns.query_fbin = None
     ns.groundtruth_ibin = None
     ns.id_offset = None
@@ -149,15 +151,23 @@ def _validate_recall_paths(ns: SimpleNamespace) -> None:
     ds = ns._index_config.get("dataset", {}) or {}
     qf = ds.get("query_fbin")
     gi = ds.get("groundtruth_ibin")
-    if not qf or not os.path.exists(qf):
+    qf_ok = bool(qf) and os.path.exists(qf)
+    gi_ok = bool(gi) and os.path.exists(gi)
+    if not qf_ok:
         print(
             f"警告: dataset.query_fbin 未设置或不存在: {qf!r}。"
             " 召回步骤将改走 DB 抽样 + 在线 ground truth。"
         )
-    if not gi or not os.path.exists(gi):
+    if not gi_ok:
         print(
             f"警告: dataset.groundtruth_ibin 未设置或不存在: {gi!r}。"
             " 召回步骤将改走 DB 抽样 + 在线 ground truth。"
+        )
+    if qf_ok and gi_ok and getattr(ns, "filter_val", None) is not None:
+        print(
+            f"[run_wiki] 使用预计算 .ibin GT，本地按 file_id={ns.filter_val} "
+            f"(base={ns.filter_file_id_base}, distinct={ns.filter_distinct_file_ids}) "
+            f"过滤为 eligible recall@k。"
         )
 
 
@@ -270,7 +280,32 @@ def _build_parser() -> argparse.ArgumentParser:
         "--sql-mode",
         choices=["l2_only", "l2_filter", "l2_filter_threshold"],
         default="l2_only",
-        help="SQL 模式（默认: l2_only；cuVS ground truth 仅对 l2_only 有效）",
+        help="SQL 模式（默认: l2_only；l2_filter/l2_filter_threshold 需配合 --filter-val）",
+    )
+    parser.add_argument(
+        "--filter-val",
+        type=int,
+        default=None,
+        help="file_id 过滤值；l2_filter / l2_filter_threshold 必填。"
+        " SQL 中以 WHERE file_id=? 生效，本地 GT 也据此筛可用邻居（eligible recall@k）。",
+    )
+    parser.add_argument(
+        "--filter-mode",
+        choices=["pre", "post", "force", "include"],
+        default=None,
+        help="SQL 后缀：BY RANK WITH OPTION 'mode=pre|post|force|include'（可选）",
+    )
+    parser.add_argument(
+        "--filter-file-id-base",
+        type=int,
+        default=20000000,
+        help="本地过滤 GT 用的 file_id_base（与 gen.py --file-id-base 一致；默认 20000000）",
+    )
+    parser.add_argument(
+        "--filter-distinct-file-ids",
+        type=int,
+        default=50,
+        help="本地过滤 GT 用的 distinct_file_ids（与 gen.py --distinct-file-ids 一致；默认 50）",
     )
 
     # 导入相关
@@ -305,6 +340,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     cli = _build_parser().parse_args()
+
+    needs_filter = cli.sql_mode in ("l2_filter", "l2_filter_threshold")
+    if cli.command in ("all", "recall") and needs_filter and cli.filter_val is None:
+        print(
+            f"错误: --sql-mode {cli.sql_mode} 需要 --filter-val=<file_id>（整数）。"
+        )
+        return 2
+
     ns = build_args(cli)
     cmd = cli.command
 
