@@ -4,7 +4,7 @@
   "user": "dump",
   "password": "111",
   "database": "jst_app_wiki",
-  "table": "historical_file_blocks_wiki",
+  "table": "historical_file_blocks_wiki_ivfflat10m",
   "index": {
     "name": "idx_l2",
     "type": "ivfflat",
@@ -13,7 +13,7 @@
   },
   "dimension": 768,
   "env": {
-    "probe_limit": 3,
+    "probe_limit": 20,
     "kmeans_train_percent": 2,
     "ivf_preload_entries": 0
   },
