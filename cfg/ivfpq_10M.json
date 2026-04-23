@@ -13,7 +13,8 @@
     "m": 192,
     "quantization": "float16",
     "op_type": "vector_l2_ops",
-    "distribution_mode": "single"
+    "distribution_mode": "single",
+    "include": ["file_id"]
   },
   "dimension": 768,
   "env": {

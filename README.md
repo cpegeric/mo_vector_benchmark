@@ -23,12 +23,14 @@
 | **pre** | 预过滤模式 | 索引层先过滤再计算距离，减少向量计算量，性能优先 |
 | **post** | 后过滤模式（默认） | 向量计算后过滤，保证精度 |
 | **force** | 强制精确搜索 | 不使用索引，全表精确计算，作为召回率 baseline |
+| **include** | INCLUDE 列过滤 | 依赖 `index.include` 的冗余列直接在索引层内过滤，避免回表，适合 INCLUDE 列（如 `file_id`）作为谓词列 |
 
 ### 评估指标
 
 | 指标 | 说明 |
 |------|------|
 | **Recall** | 召回率，索引搜索结果与精确搜索结果的匹配度 |
+| **Eligible Recall** | 过滤召回率（`l2_filter` / `l2_filter_threshold`）：分母取 `min(k, |filtered_gt|)`；本地按 `file_id` 谓词筛 `.ibin` GT 得到 `filtered_gt`，避免过滤后 GT 少于 k 时分母过大 |
 | **QPS** | 每秒查询次数，反映系统吞吐量 |
 | **Latency** | 查询延迟（P50/P99），反映响应速度 |
 
@@ -163,7 +165,24 @@ python run_wiki.py import --config cfg/my_sharded.json --input-csv-prefix /tmp/w
 python run_wiki.py drop_index   --config cfg/ivfpq_1M.json
 python run_wiki.py create_index --config cfg/ivfpq_1M.json
 python run_wiki.py recall       --config cfg/ivfpq_1M.json -n 5000 -k 100 --concurrency 32
+
+# 带过滤的召回（eligible recall@k）
+python run_wiki.py recall --config cfg/ivfpq_1M.json \
+    --sql-mode l2_filter --filter-val 20000007 --filter-mode pre \
+    -n 1000 -k 10 --concurrency 8
 ```
+
+**过滤召回（l2_filter / l2_filter_threshold）**
+
+`--sql-mode l2_filter` / `l2_filter_threshold` 时必须提供 `--filter-val=<file_id>`，SQL 会按 `WHERE file_id = ?` 过滤，GT 也会本地按相同谓词筛选：
+
+```
+file_id = file_id_base + (row_idx - 1) % distinct_file_ids
+```
+
+`gen_csv` / `import` 默认 `file_id_base=20000000`、`distinct_file_ids=50`；若自定义过生成参数，需用 `--filter-file-id-base` / `--filter-distinct-file-ids` 告诉召回脚本同样的值，否则 GT 过滤不一致。
+
+召回公式变为 **eligible recall@k**：每条 query 的分母取 `min(k, |filtered_gt|)`，避免当 `.ibin` 深度不足导致过滤后邻居少于 k 时召回率无法达到 1.0。`.ibin` 的 `k_file` 越大，过滤后剩余邻居越多；若出现"可用 GT 不足 k"的警告，请使用更深的 groundtruth 文件（期望 `k_file >= k * distinct_file_ids`）。
 
 **常用参数**
 
@@ -175,6 +194,10 @@ python run_wiki.py recall       --config cfg/ivfpq_1M.json -n 5000 -k 100 --conc
 | `-o, --output PATH` | `gen_csv` | 输出单个 CSV 路径 |
 | `--output-csv-prefix PREFIX` | `gen_csv` | 按前缀输出多个 CSV（每个 .fbin 对应 `{PREFIX}0.csv` ...） |
 | `-n` / `-k` / `--concurrency` / `--sql-mode` | `all` / `recall` | 召回评估参数 |
+| `--filter-val` | `all` / `recall` | file_id 过滤值；`--sql-mode l2_filter` / `l2_filter_threshold` 必填 |
+| `--filter-mode` | `all` / `recall` | `pre` / `post` / `force` / `include`，SQL 执行层过滤方式（对应 `BY RANK WITH OPTION 'mode=...'`） |
+| `--filter-file-id-base` | `all` / `recall` | 本地 GT 过滤用 file_id_base，需与生成时一致（默认 20000000） |
+| `--filter-distinct-file-ids` | `all` / `recall` | 本地 GT 过滤用 distinct_file_ids，需与生成时一致（默认 50） |
 | `--expected-dim` | `gen_csv` | 期望向量维度（默认 768） |
 | `--batch-size` | `all` / `import` | INSERT 批量大小（默认 20000） |
 | `--file-id-base` / `--distinct-file-ids` | `all` / `import` / `gen_csv` | file_id 生成规则 |

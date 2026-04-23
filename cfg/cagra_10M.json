@@ -13,7 +13,8 @@
     "intermediate_graph_degree": 256,
     "graph_degree": 64,
     "itopk_size": 256,
-    "op_type": "vector_l2_ops"
+    "op_type": "vector_l2_ops",
+    "include": ["file_id"]
   },
   "dimension": 768,
   "env": {

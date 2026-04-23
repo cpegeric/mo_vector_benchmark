@@ -7,21 +7,22 @@
   "table": "historical_file_blocks_wiki",
   "index": {
     "name": "idx_l2",
-    "type": "ivfpq",
-    "lists": 4096,
-    "bits_per_code": 8,
-    "m": 192,
-    "quantization": "float16",
-    "op_type": "vector_l2_ops",
+    "type": "cagra",
     "distribution_mode": "sharded",
+    "quantization": "float16",
+    "intermediate_graph_degree": 256,
+    "graph_degree": 64,
+    "itopk_size": 256,
+    "op_type": "vector_l2_ops",
     "include": ["file_id"]
   },
   "dimension": 768,
   "env": {
-    "probe_limit": 128,
-    "ivfpq_max_index_capacity": 10000000,
-    "ivfpq_batch_window": 1000,
-    "kmeans_train_percent": 20
+    "experimental_cagra_index": 1,
+    "cagra_max_index_capacity": 88000000,
+    "cagra_batch_window": 1000,
+    "cagra_threads_build": 0,
+    "cagra_threads_search": 0
   },
   "dataset": {
     "base_fbin": ["/home/ubuntu/github/vector_benchmark/wiki_all_10M/base.10M.fbin"],

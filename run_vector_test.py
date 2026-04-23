@@ -137,17 +137,33 @@ def apply_env(cursor, cfg: dict) -> None:
         cursor.execute(sql)
 
 
+def _build_include_clause(index_cfg: dict) -> str:
+    """index.include 为非空列表时，返回 ' INCLUDE (`c1`, `c2`)'；否则空串。"""
+    include = index_cfg.get("include")
+    if not include:
+        return ""
+    if not isinstance(include, (list, tuple)):
+        raise ValueError(
+            f"index.include 必须是字符串数组，收到: {type(include).__name__}"
+        )
+    cols = [str(c).strip() for c in include if str(c).strip()]
+    if not cols:
+        return ""
+    return " INCLUDE (" + ", ".join(f"`{c}`" for c in cols) + ")"
+
+
 def build_create_index_sql(table: str, index_cfg: dict) -> str:
     """根据 index 配置构造 CREATE INDEX SQL。支持 cagra / ivfpq / ivfflat / hnsw。"""
     idx_name = index_cfg.get("name", "idx_l2")
     idx_type = (index_cfg.get("type") or "ivfflat").lower()
     dist = index_cfg.get("op_type", "vector_l2_ops")
+    include_clause = _build_include_clause(index_cfg)
 
     if idx_type == "ivfflat":
         lists = index_cfg.get("lists", 1000)
         return (
             f'CREATE INDEX {idx_name} USING ivfflat ON `{table}`(embedding) '
-            f'lists={lists} op_type "{dist}"'
+            f'lists={lists} op_type "{dist}"{include_clause}'
         )
     if idx_type == "hnsw":
         m = index_cfg.get("m", 100)
@@ -155,7 +171,7 @@ def build_create_index_sql(table: str, index_cfg: dict) -> str:
         ef_s = index_cfg.get("ef_search", 200)
         return (
             f'CREATE INDEX {idx_name} USING hnsw ON `{table}`(embedding) '
-            f'm={m} ef_construction={ef_c} ef_search={ef_s} op_type "{dist}"'
+            f'm={m} ef_construction={ef_c} ef_search={ef_s} op_type "{dist}"{include_clause}'
         )
     if idx_type == "cagra":
         dm = index_cfg.get("distribution_mode", "single")
@@ -167,7 +183,7 @@ def build_create_index_sql(table: str, index_cfg: dict) -> str:
             f'CREATE INDEX {idx_name} USING cagra ON `{table}`(embedding) '
             f'distribution_mode "{dm}" quantization "{q}" '
             f'intermediate_graph_degree={igd} graph_degree={gd} '
-            f'itopk_size={itopk} op_type "{dist}"'
+            f'itopk_size={itopk} op_type "{dist}"{include_clause}'
         )
     if idx_type == "ivfpq":
         lists = index_cfg.get("lists", 1024)
@@ -179,7 +195,7 @@ def build_create_index_sql(table: str, index_cfg: dict) -> str:
             f'CREATE INDEX {idx_name} USING ivfpq ON `{table}`(embedding) '
             f"LISTS {lists} BITS_PER_CODE {bits_per_code} M {m} "
             f"OP_TYPE '{dist}' QUANTIZATION '{q}' "
-            f"DISTRIBUTION_MODE '{dm}'"
+            f"DISTRIBUTION_MODE '{dm}'{include_clause}"
         )
     raise ValueError(
         f"未知索引类型: {idx_type}（支持 cagra / ivfpq / ivfflat / hnsw）"
@@ -526,6 +542,14 @@ def run_eval(args):
     if id_offset is not None:
         cmd.extend(["--id-offset", str(id_offset)])
 
+    # 本地 filtered-GT 生成所需参数（仅 filter 模式下有意义）
+    filter_file_id_base = getattr(args, "filter_file_id_base", None)
+    filter_distinct_file_ids = getattr(args, "filter_distinct_file_ids", None)
+    if filter_file_id_base is not None:
+        cmd.extend(["--filter-file-id-base", str(filter_file_id_base)])
+    if filter_distinct_file_ids is not None:
+        cmd.extend(["--filter-distinct-file-ids", str(filter_distinct_file_ids)])
+
     print(f"执行: {' '.join(cmd)}")
     result = subprocess.run(cmd)
     return result.returncode
@@ -725,7 +749,7 @@ def main():
     run_parser.add_argument("--max-distinct-file-ids", type=int, default=50, help="最多使用多少个不同的 file_id")
     run_parser.add_argument("--skip-db-verify", action="store_true", help="跳过数据库预检")
     run_parser.add_argument("--probe", type=int, help="设置 probe_limit 值（用于 IVF 索引查询）")
-    run_parser.add_argument("--filter-mode", choices=["pre", "post", "force"], help="SQL 后缀模式：pre（预过滤）、post（后过滤）、force（强制精确搜索）")
+    run_parser.add_argument("--filter-mode", choices=["pre", "post", "force", "include"], help="SQL 后缀模式：pre（预过滤）、post（后过滤）、force（强制精确搜索）、include（INCLUDE 列过滤）")
     run_parser.add_argument("--query-fbin", help="cuVS 查询向量文件（float32 .fbin）。与 --groundtruth-ibin 同时给出时，l2_only 模式将用文件代替 DB 抽样与暴力 SQL ground truth")
     run_parser.add_argument("--groundtruth-ibin", help="cuVS ground-truth 近邻文件（.neighbors.ibin）")
     run_parser.add_argument("--id-offset", type=int, default=1, help="fbin 0-based 索引 i 映射到 DB id = i + id_offset（AUTO_INCREMENT 从 1 开始时默认 1）")
