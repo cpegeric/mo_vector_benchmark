@@ -67,6 +67,7 @@ import os
 import subprocess
 import sys
 import struct
+import time
 from typing import Iterator, Optional, Dict
 
 # 脚本路径
@@ -368,11 +369,15 @@ def run_wiki_create_index(args):
                     pass
 
                 create_sql = build_create_index_sql(args.table, index_cfg)
-                print(f"  执行: {create_sql}")
+                print(f"  执行: {create_sql}", flush=True)
+                t0 = time.perf_counter()
                 cur.execute(create_sql)
+                elapsed = time.perf_counter() - t0
+                rowcount = cur.rowcount
                 print(
                     f'  向量索引已创建 (type={index_cfg.get("type")}, '
-                    f'name={idx_name}, op_type={index_cfg.get("op_type", "vector_l2_ops")})'
+                    f'name={idx_name}, op_type={index_cfg.get("op_type", "vector_l2_ops")}, '
+                    f'rowcount={rowcount}, 耗时 {elapsed:.2f} s)'
                 )
         else:
             # 旧路径：仅 IVFFLAT，由 --ivf-lists 控制
@@ -388,10 +393,14 @@ def run_wiki_create_index(args):
                     f'CREATE INDEX idx_l2 USING ivfflat ON `{args.table}`(embedding) '
                     f'lists={ivf_lists} op_type "vector_l2_ops"'
                 )
+                print(f"  执行: {create_idx_sql}", flush=True)
+                t0 = time.perf_counter()
                 cur.execute(create_idx_sql)
+                elapsed = time.perf_counter() - t0
+                rowcount = cur.rowcount
                 print(
                     f'  向量索引已创建 (IVFFLAT, lists={ivf_lists}, '
-                    f'op_type="vector_l2_ops")'
+                    f'op_type="vector_l2_ops", rowcount={rowcount}, 耗时 {elapsed:.2f} s)'
                 )
 
         conn.close()
