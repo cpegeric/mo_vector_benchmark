@@ -18,9 +18,9 @@
     "ivf_preload_entries": 0
   },
   "dataset": {
-    "base_fbin": ["/home/ubuntu/github/vector_benchmark/wiki_all_10M/base.10M.fbin"],
-    "query_fbin": "/home/ubuntu/github/vector_benchmark/wiki_all_10M/queries.fbin",
-    "groundtruth_ibin": "/home/ubuntu/github/vector_benchmark/wiki_all_10M/groundtruth.10M.neighbors.ibin",
+    "base_fbin": ["/home/ubuntu/github/vector_benchmark/data/wiki_all_88M/base.88M.fbin"],
+    "query_fbin": "/home/ubuntu/github/vector_benchmark/data/wiki_all_88M/queries.fbin",
+    "groundtruth_ibin": "/home/ubuntu/github/vector_benchmark/data/wiki_all_88M/groundtruth.88M.neighbors.ibin",
     "id_offset": 1
   }
 }
