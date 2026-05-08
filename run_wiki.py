@@ -100,8 +100,10 @@ def build_args(cli) -> SimpleNamespace:
     ns.concurrency = cli.concurrency
     ns.filter_val = cli.filter_val
     ns.duration = None
-    ns.distribute_file_ids = False
-    ns.max_distinct_file_ids = 50
+    # 当 l2_filter/l2_filter_threshold 且未指定 filter_val 时，自动启用分布式 file_ids
+    needs_filter = cli.sql_mode in ("l2_filter", "l2_filter_threshold")
+    ns.distribute_file_ids = cli.distribute_file_ids or (needs_filter and cli.filter_val is None)
+    ns.max_distinct_file_ids = cli.max_distinct_file_ids
     ns.skip_db_verify = True
     ns.probe = (cfg.get("env", {}) or {}).get("probe_limit")
     ns.filter_mode = cli.filter_mode
@@ -286,8 +288,20 @@ def _build_parser() -> argparse.ArgumentParser:
         "--filter-val",
         type=int,
         default=None,
-        help="file_id 过滤值；l2_filter / l2_filter_threshold 必填。"
-        " SQL 中以 WHERE file_id=? 生效，本地 GT 也据此筛可用邻居（eligible recall@k）。",
+        help="file_id 过滤值（可选）。若不指定，l2_filter/l2_filter_threshold 模式下将自动启用 --distribute-file-ids。"
+        " 指定时：SQL 中以 WHERE file_id=? 生效，本地 GT 也据此筛可用邻居（eligible recall@k）。",
+    )
+    parser.add_argument(
+        "--distribute-file-ids",
+        action="store_true",
+        help="将查询均匀分布到表中多个 DISTINCT file_id 上（l2_filter/l2_filter_threshold 模式下，"
+        "若未指定 --filter-val 则自动启用）。配合 --max-distinct-file-ids 控制使用多少个不同的 file_id。",
+    )
+    parser.add_argument(
+        "--max-distinct-file-ids",
+        type=int,
+        default=50,
+        help="配合 --distribute-file-ids 使用，指定最多使用多少个 DISTINCT file_id（默认 50，0 表示不限制）。",
     )
     parser.add_argument(
         "--filter-mode",
@@ -341,12 +355,8 @@ def _build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     cli = _build_parser().parse_args()
 
-    needs_filter = cli.sql_mode in ("l2_filter", "l2_filter_threshold")
-    if cli.command in ("all", "recall") and needs_filter and cli.filter_val is None:
-        print(
-            f"错误: --sql-mode {cli.sql_mode} 需要 --filter-val=<file_id>（整数）。"
-        )
-        return 2
+    # l2_filter/l2_filter_threshold 模式下，filter_val 和 distribute_file_ids 现在都是可选的
+    # 如果都没指定，会在 build_args 中自动启用 distribute_file_ids
 
     ns = build_args(cli)
     cmd = cli.command
