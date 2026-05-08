@@ -193,7 +193,10 @@ def convert_fbin_to_csv(
 
     rng = np.random.default_rng(seed)
     written = 0
-    global_i = 1
+    # Honor skip_rows so id/file_id/page_num match a single-threaded run that
+    # processes the whole fbin: shard starting at fbin row `skip_rows` uses
+    # global i = skip_rows + 1 for its first row.
+    global_i = skip_rows + 1
     outputs: List[str] = []
 
     def _ensure_dir_for(path: str) -> None:
