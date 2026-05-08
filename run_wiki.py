@@ -105,6 +105,7 @@ def build_args(cli) -> SimpleNamespace:
     ns.distribute_file_ids = cli.distribute_file_ids or (needs_filter and cli.filter_val is None)
     ns.max_distinct_file_ids = cli.max_distinct_file_ids
     ns.skip_db_verify = True
+    ns.skip_recall = cli.skip_recall
     ns.probe = (cfg.get("env", {}) or {}).get("probe_limit")
     ns.filter_mode = cli.filter_mode
     ns.filter_file_id_base = cli.filter_file_id_base
@@ -302,6 +303,11 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=50,
         help="配合 --distribute-file-ids 使用，指定最多使用多少个 DISTINCT file_id（默认 50，0 表示不限制）。",
+    )
+    parser.add_argument(
+        "--skip-recall",
+        action="store_true",
+        help="只测试 QPS，不计算 recall（不执行 ground truth SQL，仅执行实际检索，速度更快）。",
     )
     parser.add_argument(
         "--filter-mode",
