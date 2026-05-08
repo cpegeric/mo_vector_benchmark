@@ -1428,6 +1428,9 @@ def evaluate(
     id_offset: int = 1,
     filter_file_id_base: Optional[int] = None,
     filter_distinct_file_ids: Optional[int] = None,
+    save_query_vectors: Optional[str] = None,
+    load_query_vectors: Optional[str] = None,
+    skip_recall: bool = False,
 ):
     if database:
         DB_CONFIG["database"] = database
@@ -1650,6 +1653,24 @@ def evaluate(
                 f"({len(per_query_filters_opt)} rows)."
             )
         print(f"loaded {len(query_vecs)} queries and corresponding ground truth from files.")
+    elif load_query_vectors:
+        # 从保存的向量文件加载
+        print(f"loading query vectors from {load_query_vectors}...")
+        with open(load_query_vectors, "rb") as f:
+            saved_data = pickle.load(f)
+        query_vecs = saved_data["query_vecs"]
+        per_query_filters_opt = saved_data.get("filters", None)
+        mode_int_saved = saved_data.get("mode_int")
+
+        if mode_int_saved and mode_int_saved != mode_int:
+            print(f"WARNING: 保存的 mode={mode_int_to_str(mode_int_saved)}，但当前指定 mode={mode}，可能不匹配")
+
+        if num_queries < len(query_vecs):
+            query_vecs = query_vecs[:num_queries]
+            if per_query_filters_opt:
+                per_query_filters_opt = per_query_filters_opt[:num_queries]
+
+        print(f"loaded {len(query_vecs)} query vectors from {load_query_vectors}")
     else:
         # 从数据库抽样并固定查询向量，同时在线计算 ground truth
         conn = get_conn()
@@ -1696,6 +1717,20 @@ def evaluate(
             if not query_vecs:
                 print("no query vectors sampled, please check data.")
                 return
+
+            # 如果指定了保存路径，保存查询向量
+            if save_query_vectors:
+                save_data = {
+                    "query_vecs": query_vecs,
+                    "filters": per_query_filters_opt,
+                    "mode_int": mode_int,
+                    "mode": mode,
+                    "k": k,
+                    "num_queries": len(query_vecs),
+                }
+                with open(save_query_vectors, "wb") as f:
+                    pickle.dump(save_data, f)
+                print(f"saved {len(query_vecs)} query vectors to {save_query_vectors}")
         finally:
             conn.close()
 
@@ -1736,7 +1771,7 @@ def evaluate(
     start_time = time.perf_counter()
     last_log_time = start_time
     # 仅生成 ann 文件时不计算召回，日志里不输出 recall
-    progress_show_recall = not (annfiles_only and write_ann_files)
+    progress_show_recall = not (annfiles_only and write_ann_files) and not skip_recall
 
     def update_progress(last_recall: float):
         """
@@ -1811,8 +1846,43 @@ def evaluate(
                     latencies.append(latency)
     else:
         # 在线计算 ground truth
+        # skip_recall 时只跑实际检索 SQL，不跑 ground truth，纯 QPS 测试
+        if skip_recall:
+            if concurrency == 1:
+                for i, vec_literal in enumerate(query_vecs):
+                    latency = evaluate_single_query_for_qps(
+                        vec_literal, k, mode_int, filter_val=q_filters[i], filter_mode=filter_mode
+                    )
+                    latencies.append(latency)
+                    update_progress(0.0)
+            else:
+                print(f"running QPS only (no recall) with {concurrency} workers...")
+                with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                    future_to_i = {
+                        executor.submit(
+                            evaluate_single_query_for_qps,
+                            query_vecs[i],
+                            k,
+                            mode_int,
+                            q_filters[i],
+                            filter_mode,
+                        ): i
+                        for i in range(len(query_vecs))
+                    }
+                    results = []
+                    for future in as_completed(future_to_i):
+                        try:
+                            latency = future.result()
+                            idx = future_to_i[future]
+                            results.append((idx, latency))
+                            update_progress(0.0)
+                        except Exception as e:
+                            print(f"query failed: {e}")
+                    results.sort(key=lambda x: x[0])
+                    for idx, latency in results:
+                        latencies.append(latency)
         # annfiles_only 时只跑 ground truth SQL，不跑实际检索，约可减半耗时
-        if annfiles_only and write_ann_files:
+        elif annfiles_only and write_ann_files:
             if concurrency == 1:
                 for i, vec_literal in enumerate(query_vecs):
                     gt, vec = fetch_ground_truth_only(
@@ -2129,6 +2199,25 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="本地过滤 GT 用的 distinct_file_ids（与 gen.py 的 --distinct-file-ids 一致；默认 50）",
     )
+    parser.add_argument(
+        "--save-query-vectors",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="保存生成的查询向量到文件（pickle 格式），供后续 --load-query-vectors 使用",
+    )
+    parser.add_argument(
+        "--load-query-vectors",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="从文件加载预先生成的查询向量（pickle 格式），跳过数据库抽样步骤",
+    )
+    parser.add_argument(
+        "--skip-recall",
+        action="store_true",
+        help="只测试 QPS，不计算 recall（不执行 ground truth SQL，速度更快）",
+    )
     return parser.parse_args()
 
 
@@ -2169,5 +2258,8 @@ if __name__ == "__main__":
         id_offset=args.id_offset,
         filter_file_id_base=args.filter_file_id_base,
         filter_distinct_file_ids=args.filter_distinct_file_ids,
+        save_query_vectors=args.save_query_vectors,
+        load_query_vectors=args.load_query_vectors,
+        skip_recall=args.skip_recall,
     )
 
