@@ -1428,7 +1428,6 @@ def evaluate(
     id_offset: int = 1,
     filter_file_id_base: Optional[int] = None,
     filter_distinct_file_ids: Optional[int] = None,
-    skip_recall: bool = False,
 ):
     if database:
         DB_CONFIG["database"] = database
@@ -1737,7 +1736,7 @@ def evaluate(
     start_time = time.perf_counter()
     last_log_time = start_time
     # 仅生成 ann 文件时不计算召回，日志里不输出 recall
-    progress_show_recall = not (annfiles_only and write_ann_files) and not skip_recall
+    progress_show_recall = not (annfiles_only and write_ann_files)
 
     def update_progress(last_recall: float):
         """
@@ -1812,43 +1811,8 @@ def evaluate(
                     latencies.append(latency)
     else:
         # 在线计算 ground truth
-        # skip_recall 时只跑实际检索 SQL，不跑 ground truth，纯 QPS 测试
-        if skip_recall:
-            if concurrency == 1:
-                for i, vec_literal in enumerate(query_vecs):
-                    latency = evaluate_single_query_for_qps(
-                        vec_literal, k, mode_int, filter_val=q_filters[i], filter_mode=filter_mode
-                    )
-                    latencies.append(latency)
-                    update_progress(0.0)
-            else:
-                print(f"running QPS only (no recall) with {concurrency} workers...")
-                with ThreadPoolExecutor(max_workers=concurrency) as executor:
-                    future_to_i = {
-                        executor.submit(
-                            evaluate_single_query_for_qps,
-                            query_vecs[i],
-                            k,
-                            mode_int,
-                            q_filters[i],
-                            filter_mode,
-                        ): i
-                        for i in range(len(query_vecs))
-                    }
-                    results = []
-                    for future in as_completed(future_to_i):
-                        try:
-                            latency = future.result()
-                            idx = future_to_i[future]
-                            results.append((idx, latency))
-                            update_progress(0.0)
-                        except Exception as e:
-                            print(f"query failed: {e}")
-                    results.sort(key=lambda x: x[0])
-                    for idx, latency in results:
-                        latencies.append(latency)
         # annfiles_only 时只跑 ground truth SQL，不跑实际检索，约可减半耗时
-        elif annfiles_only and write_ann_files:
+        if annfiles_only and write_ann_files:
             if concurrency == 1:
                 for i, vec_literal in enumerate(query_vecs):
                     gt, vec = fetch_ground_truth_only(
@@ -2165,11 +2129,6 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="本地过滤 GT 用的 distinct_file_ids（与 gen.py 的 --distinct-file-ids 一致；默认 50）",
     )
-    parser.add_argument(
-        "--skip-recall",
-        action="store_true",
-        help="只测试 QPS，不计算 recall（不执行 ground truth SQL，仅执行实际检索）",
-    )
     return parser.parse_args()
 
 
@@ -2210,6 +2169,5 @@ if __name__ == "__main__":
         id_offset=args.id_offset,
         filter_file_id_base=args.filter_file_id_base,
         filter_distinct_file_ids=args.filter_distinct_file_ids,
-        skip_recall=args.skip_recall,
     )
 

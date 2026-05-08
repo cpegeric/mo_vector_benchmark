@@ -550,10 +550,6 @@ def run_eval(args):
     if filter_distinct_file_ids is not None:
         cmd.extend(["--filter-distinct-file-ids", str(filter_distinct_file_ids)])
 
-    # skip_recall 设置
-    if hasattr(args, 'skip_recall') and args.skip_recall:
-        cmd.append("--skip-recall")
-
     print(f"执行: {' '.join(cmd)}")
     result = subprocess.run(cmd)
     return result.returncode
