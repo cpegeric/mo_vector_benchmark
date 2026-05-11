@@ -20,7 +20,7 @@
   "env": {
     "experimental_cagra_index": 1,
     "cagra_max_index_capacity": 10000000,
-    "cagra_batch_window": 1000,
+    "cagra_batch_window": 0,
     "cagra_threads_build": 0,
     "cagra_threads_search": 0
   },

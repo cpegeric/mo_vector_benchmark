@@ -20,7 +20,7 @@
   "env": {
     "probe_limit": 64,
     "ivfpq_max_index_capacity": 1000000,
-    "ivfpq_batch_window": 1000,
+    "ivfpq_batch_window": 0,
     "kmeans_train_percent": 10
   },
   "dataset": {
