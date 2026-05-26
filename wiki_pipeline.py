@@ -131,21 +131,89 @@ def validate_import_paths(args: Any) -> int:
 
 
 def validate_recall_paths(args: Any) -> None:
-    cfg = getattr(args, "_index_config", None) or {}
-    ds = cfg.get("dataset", {}) or {}
-    qf = ds.get("query_fbin")
-    gi = ds.get("groundtruth_ibin")
-    qf_ok = bool(qf) and os.path.exists(qf)
-    gi_ok = bool(gi) and os.path.exists(gi)
-    if not qf_ok:
+    from run_vector_test import (
+        _paths_ann_ready,
+        _paths_fbin_ready,
+        apply_gt_source,
+        resolve_gt_source,
+    )
+
+    ds = (getattr(args, "_index_config", None) or {}).get("dataset", {}) or {}
+
+    def _pick(attr: str, key: str):
+        v = getattr(args, attr, None)
+        if v is not None and v != "":
+            return v
+        return ds.get(key)
+
+    id_offset = getattr(args, "id_offset", None)
+    if id_offset is None or id_offset == 1 and "id_offset" in ds:
+        id_offset = ds.get("id_offset")
+
+    raw_paths = {
+        "query_fbin": _pick("query_fbin", "query_fbin"),
+        "groundtruth_ibin": _pick("groundtruth_ibin", "groundtruth_ibin"),
+        "query_fvecs": _pick("query_fvecs", "query_fvecs"),
+        "groundtruth_ivecs": _pick("groundtruth_ivecs", "groundtruth_ivecs"),
+        "id_mapping": _pick("id_mapping", "id_mapping"),
+        "query_filters": _pick("query_filters", "query_filters"),
+        "id_offset": id_offset,
+    }
+
+    try:
+        paths = apply_gt_source(raw_paths, resolve_gt_source(args))
+    except ValueError as e:
+        print(f"错误: {e}")
+        return
+
+    effective = paths.get("_gt_source_effective", "db")
+    gt_src = resolve_gt_source(args)
+
+    def _exists(p):
+        return bool(p) and os.path.isfile(p)
+
+    if effective == "ann":
         print(
-            f"警告: dataset.query_fbin 未设置或不存在: {qf!r}。"
-            " 召回将改走 DB 抽样 + 在线 ground truth。"
+            f"[pipeline] GT 来源=ann (--gt-source={gt_src}): "
+            f"query_fvecs={paths.get('query_fvecs')!r}"
         )
-    if not gi_ok:
+        for label, p in (
+            ("query_fvecs", paths.get("query_fvecs")),
+            ("groundtruth_ivecs", paths.get("groundtruth_ivecs")),
+            ("id_mapping", paths.get("id_mapping")),
+        ):
+            if p and not _exists(p):
+                print(f"警告: {label} 路径不存在: {p!r}")
+    elif effective == "fbin":
         print(
-            f"警告: dataset.groundtruth_ibin 未设置或不存在: {gi!r}。"
-            " 召回将改走 DB 抽样 + 在线 ground truth。"
+            f"[pipeline] GT 来源=fbin (--gt-source={gt_src}): "
+            f"query_fbin={paths.get('query_fbin')!r}"
+        )
+        for label, p in (
+            ("query_fbin", paths.get("query_fbin")),
+            ("groundtruth_ibin", paths.get("groundtruth_ibin")),
+        ):
+            if p and not _exists(p):
+                print(f"警告: {label} 路径不存在: {p!r}")
+    else:
+        print(
+            f"[pipeline] GT 来源=DB 在线 (--gt-source={gt_src})；"
+            " 未启用完整的 fbin 或 ann 文件集。"
+        )
+
+    raw_fbin = _paths_fbin_ready(raw_paths)
+    raw_ann = _paths_ann_ready(raw_paths)
+    if raw_fbin and raw_ann and gt_src == "auto":
+        print(
+            "提示: cfg 中同时配置了 fbin/ibin 与 ann 三件套，auto 默认使用 fbin；"
+            " 测 ann 请加 --gt-source ann。"
+        )
+
+    if effective in ("fbin", "ann") and getattr(args, "filter_val", None) is not None:
+        print(
+            f"[pipeline] 过滤召回 file_id={args.filter_val} "
+            f"(base={getattr(args, 'filter_file_id_base', None)}, "
+            f"distinct={getattr(args, 'filter_distinct_file_ids', None)})"
         )
 
 

@@ -13,7 +13,7 @@ run_wiki.py — Wiki-all 基准测试子命令入口
   create_index  仅创建向量索引
   drop_index    删除向量索引（index.name 取自 JSON；兼容旧名 idx_embedding）
   gen_csv       从 dataset.base_fbin 生成 LOAD DATA 兼容的 6 列 CSV（不连库）
-  recall        仅跑召回评估
+  recall        仅跑召回评估（支持 cuVS fbin/ibin 或 ann fvecs/ivecs/id_mapping）
 
 JSON 配置（cfg/*.json）示例：
   {
@@ -21,6 +21,9 @@ JSON 配置（cfg/*.json）示例：
       "base_fbin":        "/path/to/wiki_all_1M.fbin",
       "query_fbin":       "/path/to/queries.fbin",
       "groundtruth_ibin": "/path/to/groundtruth.neighbors.ibin",
+      "query_fvecs":      "/path/to/query_l2_only_k10.fvecs",
+      "groundtruth_ivecs":"/path/to/groundtruth_l2_only_k10.ivecs",
+      "id_mapping":       "/path/to/id_mapping_l2_only_k10.txt",
       "id_offset": 1
     }
   }
@@ -37,8 +40,15 @@ JSON 配置（cfg/*.json）示例：
   python run_wiki.py all --config cfg/ivfpq_1M.json --csv /tmp/wiki_1M.csv \
       -n 5000 -k 100 --concurrency 32
 
-  # 只跑召回 / 只删索引
-  python run_wiki.py recall     --config cfg/ivfpq_1M.json -n 5000 -k 100 --concurrency 32
+  # 只跑召回（cuVS fbin/ibin，cfg.dataset 或 CLI）
+  python run_wiki.py recall --config cfg/ivfflat_10M.json -n 5000 -k 100 --concurrency 32
+
+  # 只跑召回（ann-benchmarks 预生成文件，与 run_vector_test.py run 一致）
+  python run_wiki.py recall --config cfg/ivfflat_10M.json \\
+      --query-fvecs query_l2_only_k10.fvecs \\
+      --groundtruth-ivecs groundtruth_l2_only_k10.ivecs \\
+      --id-mapping id_mapping_l2_only_k10.txt -n 1000 -k 10
+
   python run_wiki.py drop_index --config cfg/ivfpq_1M.json
 """
 
@@ -115,9 +125,15 @@ def build_args(cli) -> SimpleNamespace:
     ns.filter_mode = cli.filter_mode
     ns.filter_file_id_base = cli.filter_file_id_base
     ns.filter_distinct_file_ids = cli.filter_distinct_file_ids
-    ns.query_fbin = None
-    ns.groundtruth_ibin = None
-    ns.id_offset = None
+    ns.query_fbin = getattr(cli, "query_fbin", None)
+    ns.groundtruth_ibin = getattr(cli, "groundtruth_ibin", None)
+    ns.query_fvecs = getattr(cli, "query_fvecs", None)
+    ns.groundtruth_ivecs = getattr(cli, "groundtruth_ivecs", None)
+    ns.id_mapping = getattr(cli, "id_mapping", None)
+    ns.query_filters = getattr(cli, "query_filters", None)
+    ns.id_offset = getattr(cli, "id_offset", None)
+    ns.gt_source = getattr(cli, "gt_source", None)
+    ns.skip_db_verify = True
     attach_dataset_fields(ns, cfg)
 
     return ns
@@ -237,6 +253,38 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=50,
         help="本地过滤 GT 用的 distinct_file_ids（与 gen.py --distinct-file-ids 一致；默认 50）",
+    )
+
+    # 召回 GT 来源（CLI 覆盖 cfg.dataset；fbin/ibin 优先于 fvecs 三件套，与 eval 一致）
+    parser.add_argument("--query-fbin", default=None, help="cuVS query.fbin（覆盖 cfg.dataset）")
+    parser.add_argument("--groundtruth-ibin", default=None, help="cuVS groundtruth.neighbors.ibin")
+    parser.add_argument(
+        "--query-fvecs",
+        default=None,
+        help="ann-benchmarks query.fvecs（需同时有 groundtruth.ivecs + id_mapping）",
+    )
+    parser.add_argument("--groundtruth-ivecs", default=None, help="groundtruth.ivecs")
+    parser.add_argument(
+        "--id-mapping",
+        default=None,
+        help="id_mapping.txt（ivecs 下标 -> row_id）",
+    )
+    parser.add_argument(
+        "--query-filters",
+        default=None,
+        help="与 query.fvecs 配套的每行 file_id；不设则尝试 .filters.txt",
+    )
+    parser.add_argument(
+        "--id-offset",
+        type=int,
+        default=None,
+        help="fbin/ibin 索引映射 DB id = i + offset（默认读 cfg.dataset.id_offset 或 1）",
+    )
+    parser.add_argument(
+        "--gt-source",
+        choices=["auto", "fbin", "ann"],
+        default=None,
+        help="GT 来源：auto=有 fbin 用 fbin；fbin/ann=强制一套（两套都配时区分测试）",
     )
 
     # 导入相关

@@ -448,6 +448,140 @@ def run_wiki_test(args):
     return result.returncode
 
 
+GT_SOURCE_CHOICES = ("auto", "fbin", "ann")
+
+
+def resolve_gt_source(args) -> str:
+    """CLI --gt-source 优先，其次 cfg.dataset.gt_source，默认 auto。"""
+    cli = getattr(args, "gt_source", None)
+    if cli is not None and str(cli).strip():
+        return str(cli).strip().lower()
+    ds = (getattr(args, "_index_config", None) or {}).get("dataset", {}) or {}
+    return str(ds.get("gt_source", "auto")).strip().lower() or "auto"
+
+
+def _paths_fbin_ready(paths: dict) -> bool:
+    return bool(paths.get("query_fbin") and paths.get("groundtruth_ibin"))
+
+
+def _paths_ann_ready(paths: dict) -> bool:
+    return all(
+        paths.get(k) for k in ("query_fvecs", "groundtruth_ivecs", "id_mapping")
+    )
+
+
+def apply_gt_source(paths: dict, gt_source: str) -> dict:
+    """按 gt_source 只保留一套 GT 路径，避免 eval 隐式优先 fbin。"""
+    src = (gt_source or "auto").lower()
+    if src not in GT_SOURCE_CHOICES:
+        raise ValueError(
+            f"无效 --gt-source={gt_source!r}，可选: {', '.join(GT_SOURCE_CHOICES)}"
+        )
+
+    out = dict(paths)
+    fbin_ok = _paths_fbin_ready(out)
+    ann_ok = _paths_ann_ready(out)
+
+    if src == "fbin":
+        if not fbin_ok:
+            raise ValueError(
+                "--gt-source fbin 需要 query_fbin 与 groundtruth_ibin（cfg.dataset 或 CLI）"
+            )
+        out["query_fvecs"] = None
+        out["groundtruth_ivecs"] = None
+        out["id_mapping"] = None
+        out["query_filters"] = None
+    elif src == "ann":
+        if not ann_ok:
+            raise ValueError(
+                "--gt-source ann 需要 query_fvecs、groundtruth_ivecs、id_mapping（cfg.dataset 或 CLI）"
+            )
+        out["query_fbin"] = None
+        out["groundtruth_ibin"] = None
+    else:
+        if fbin_ok and ann_ok:
+            out["query_fvecs"] = None
+            out["groundtruth_ivecs"] = None
+            out["id_mapping"] = None
+            out["query_filters"] = None
+        elif fbin_ok:
+            out["query_fvecs"] = None
+            out["groundtruth_ivecs"] = None
+            out["id_mapping"] = None
+            out["query_filters"] = None
+        elif ann_ok:
+            out["query_fbin"] = None
+            out["groundtruth_ibin"] = None
+
+    if _paths_fbin_ready(out):
+        out["_gt_source_effective"] = "fbin"
+    elif _paths_ann_ready(out):
+        out["_gt_source_effective"] = "ann"
+    else:
+        out["_gt_source_effective"] = "db"
+    return out
+
+
+def resolve_recall_dataset_paths(args) -> dict:
+    """合并 CLI 与 cfg.dataset 的 query/GT 路径（CLI 优先）。"""
+    ds = (getattr(args, "_index_config", None) or {}).get("dataset", {}) or {}
+
+    def pick(attr: str, key: str):
+        v = getattr(args, attr, None)
+        if v is not None and v != "":
+            return v
+        return ds.get(key)
+
+    id_offset = getattr(args, "id_offset", None)
+    if id_offset is None or id_offset == 1:
+        if "id_offset" in ds:
+            id_offset = ds["id_offset"]
+
+    paths = {
+        "query_fbin": pick("query_fbin", "query_fbin"),
+        "groundtruth_ibin": pick("groundtruth_ibin", "groundtruth_ibin"),
+        "query_fvecs": pick("query_fvecs", "query_fvecs"),
+        "groundtruth_ivecs": pick("groundtruth_ivecs", "groundtruth_ivecs"),
+        "id_mapping": pick("id_mapping", "id_mapping"),
+        "query_filters": pick("query_filters", "query_filters"),
+        "id_offset": id_offset,
+    }
+    return apply_gt_source(paths, resolve_gt_source(args))
+
+
+def extend_eval_recall_dataset_cmd(args, cmd: list) -> Optional[str]:
+    """把选定来源的 GT 路径追加到 eval 命令行；失败返回错误信息。"""
+    try:
+        paths = resolve_recall_dataset_paths(args)
+    except ValueError as e:
+        return str(e)
+
+    effective = paths.get("_gt_source_effective", "db")
+    if effective == "fbin":
+        print(f"  GT 来源: cuVS fbin/ibin (--gt-source={resolve_gt_source(args)})")
+    elif effective == "ann":
+        print(f"  GT 来源: ann fvecs/ivecs/id_mapping (--gt-source={resolve_gt_source(args)})")
+    else:
+        print(f"  GT 来源: DB 抽样 + 在线 GT (--gt-source={resolve_gt_source(args)})")
+
+    if paths.get("query_fbin"):
+        cmd.extend(["--query-fbin", str(paths["query_fbin"])])
+    if paths.get("groundtruth_ibin"):
+        cmd.extend(["--groundtruth-ibin", str(paths["groundtruth_ibin"])])
+    if paths.get("id_offset") is not None:
+        cmd.extend(["--id-offset", str(paths["id_offset"])])
+
+    if paths.get("query_fvecs"):
+        cmd.extend(["--query-fvecs", str(paths["query_fvecs"])])
+    if paths.get("groundtruth_ivecs"):
+        cmd.extend(["--groundtruth-ivecs", str(paths["groundtruth_ivecs"])])
+    if paths.get("id_mapping"):
+        cmd.extend(["--id-mapping", str(paths["id_mapping"])])
+    if paths.get("query_filters"):
+        cmd.extend(["--query-filters", str(paths["query_filters"])])
+    return None
+
+
 def run_ann(args):
     """生成 ANN 评测文件（调用 eval_vector_search_from_table.py）"""
     cmd = [sys.executable, EVAL_SCRIPT]
@@ -535,24 +669,11 @@ def run_eval(args):
     if hasattr(args, 'filter_mode') and args.filter_mode:
         cmd.extend(["--filter-mode", args.filter_mode])
 
-    # 数据集文件（cuVS query.fbin + groundtruth.neighbors.ibin）
-    cfg = getattr(args, "_index_config", None) or {}
-    ds = cfg.get("dataset", {}) or {}
-
-    query_fbin = getattr(args, "query_fbin", None) or ds.get("query_fbin")
-    groundtruth_ibin = getattr(args, "groundtruth_ibin", None) or ds.get("groundtruth_ibin")
-    id_offset = getattr(args, "id_offset", None)
-    if id_offset is None or id_offset == 1:
-        # CLI 仍为默认值时，允许 JSON 覆盖
-        if "id_offset" in ds:
-            id_offset = ds["id_offset"]
-
-    if query_fbin:
-        cmd.extend(["--query-fbin", str(query_fbin)])
-    if groundtruth_ibin:
-        cmd.extend(["--groundtruth-ibin", str(groundtruth_ibin)])
-    if id_offset is not None:
-        cmd.extend(["--id-offset", str(id_offset)])
+    # 数据集文件：cuVS fbin/ibin 或 ann-benchmarks fvecs/ivecs/id_mapping
+    gt_err = extend_eval_recall_dataset_cmd(args, cmd)
+    if gt_err:
+        print(f"错误: {gt_err}")
+        return 1
 
     # 本地 filtered-GT 生成所需参数（仅 filter 模式下有意义）
     filter_file_id_base = getattr(args, "filter_file_id_base", None)
@@ -735,6 +856,19 @@ def main():
             default=50,
             help="本地 GT 过滤 distinct_file_ids（默认: 50）",
         )
+        p.add_argument("--query-fbin", default=None, help="cuVS query.fbin")
+        p.add_argument("--groundtruth-ibin", default=None, help="cuVS groundtruth.ibin")
+        p.add_argument("--query-fvecs", default=None, help="ann query.fvecs")
+        p.add_argument("--groundtruth-ivecs", default=None, help="ann groundtruth.ivecs")
+        p.add_argument("--id-mapping", default=None, help="ann id_mapping.txt")
+        p.add_argument("--query-filters", default=None, help="ann 每行 file_id（可选）")
+        p.add_argument("--id-offset", type=int, default=None, help="fbin/ibin id 偏移")
+        p.add_argument(
+            "--gt-source",
+            choices=list(GT_SOURCE_CHOICES),
+            default=None,
+            help="GT 来源：auto=有 fbin 则用 fbin 否则 ann；fbin/ann=强制指定一套（两套都配时必用）",
+        )
 
     def _add_import_args(p):
         p.add_argument("--batch-size", type=int, default=20000, help="fbin INSERT 批量大小")
@@ -831,9 +965,28 @@ def main():
     run_parser.add_argument("--skip-db-verify", action="store_true", help="跳过数据库预检")
     run_parser.add_argument("--probe", type=int, help="设置 probe_limit 值（用于 IVF 索引查询）")
     run_parser.add_argument("--filter-mode", choices=["pre", "post", "force", "include"], help="SQL 后缀模式：pre（预过滤）、post（后过滤）、force（强制精确搜索）、include（INCLUDE 列过滤）")
-    run_parser.add_argument("--query-fbin", help="cuVS 查询向量文件（float32 .fbin）。与 --groundtruth-ibin 同时给出时，l2_only 模式将用文件代替 DB 抽样与暴力 SQL ground truth")
-    run_parser.add_argument("--groundtruth-ibin", help="cuVS ground-truth 近邻文件（.neighbors.ibin）")
-    run_parser.add_argument("--id-offset", type=int, default=1, help="fbin 0-based 索引 i 映射到 DB id = i + id_offset（AUTO_INCREMENT 从 1 开始时默认 1）")
+    run_parser.add_argument("--query-fbin", help="cuVS 查询向量 .fbin（与 --groundtruth-ibin 配对）")
+    run_parser.add_argument("--groundtruth-ibin", help="cuVS ground-truth .neighbors.ibin")
+    run_parser.add_argument(
+        "--query-fvecs",
+        help="ann-benchmarks 风格 query.fvecs（与 --groundtruth-ivecs、--id-mapping 三件套）",
+    )
+    run_parser.add_argument("--groundtruth-ivecs", help="groundtruth.ivecs（与 --query-fvecs 配对）")
+    run_parser.add_argument(
+        "--id-mapping",
+        help="id_mapping.txt：ivecs 下标 -> row_id（如 file_id\\tid）",
+    )
+    run_parser.add_argument(
+        "--query-filters",
+        help="与 --query-fvecs 配套：每行一个 file_id；不设则尝试同名 .filters.txt",
+    )
+    run_parser.add_argument("--id-offset", type=int, default=1, help="fbin 索引映射 DB id = i + id_offset（默认 1）")
+    run_parser.add_argument(
+        "--gt-source",
+        choices=list(GT_SOURCE_CHOICES),
+        default=None,
+        help="GT 来源：auto / fbin / ann（见 run_wiki recall --gt-source）",
+    )
 
     args = parser.parse_args()
 

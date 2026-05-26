@@ -192,6 +192,32 @@ file_id = file_id_base + (row_idx - 1) % distinct_file_ids
 
 `gen_csv` / `import` 默认 `file_id_base=20000000`、`distinct_file_ids=50`；若自定义过生成参数，需用 `--filter-file-id-base` / `--filter-distinct-file-ids` 告诉召回脚本同样的值，否则 GT 过滤不一致。
 
+**召回 GT 来源（`recall` / `run` / `all` 最后一步）**
+
+| 方式 | cfg `dataset` 字段 | CLI（覆盖 cfg） |
+|------|-------------------|-----------------|
+| cuVS 文件 | `query_fbin`, `groundtruth_ibin`, `id_offset` | `--query-fbin`, `--groundtruth-ibin`, `--id-offset` |
+| ann-benchmarks | `query_fvecs`, `groundtruth_ivecs`, `id_mapping` | `--query-fvecs`, `--groundtruth-ivecs`, `--id-mapping` |
+
+两套都写在 cfg 时，用 **`--gt-source`** 区分（或 cfg 里 `"gt_source": "fbin"` / `"ann"`）：
+
+| `--gt-source` | 行为 |
+|---------------|------|
+| `auto`（默认） | 有完整 fbin/ibin 则用 fbin，否则用 ann 三件套 |
+| `fbin` | 只用 cuVS fbin/ibin |
+| `ann` | 只用 ann fvecs/ivecs/id_mapping |
+
+```bash
+# cuVS 预计算 GT
+python run_wiki.py recall --config cfg/ivfflat_10M.json --gt-source fbin -n 5000 -k 100 --concurrency 32
+
+# ann-benchmarks 预生成 GT（run_vector_test.py ann 产出）
+python run_wiki.py recall --config cfg/ivfflat_10M.json --gt-source ann \\
+  --query-fvecs query_l2_only_k100.fvecs \\
+  --groundtruth-ivecs groundtruth_l2_only_k100.ivecs \\
+  --id-mapping id_mapping_l2_only_k100.txt -n 5000 -k 100 --concurrency 32
+```
+
 召回公式变为 **eligible recall@k**：每条 query 的分母取 `min(k, |filtered_gt|)`，避免当 `.ibin` 深度不足导致过滤后邻居少于 k 时召回率无法达到 1.0。`.ibin` 的 `k_file` 越大，过滤后剩余邻居越多；若出现"可用 GT 不足 k"的警告，请使用更深的 groundtruth 文件（期望 `k_file >= k * distinct_file_ids`）。
 
 **常用参数**
