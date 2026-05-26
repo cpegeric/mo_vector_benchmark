@@ -6,7 +6,8 @@ run_wiki.py — Wiki-all 基准测试子命令入口
   python run_wiki.py <command> --config cfg/xxx.json [options]
 
 命令：
-  all           顺序执行 create_table → import → create_index → recall
+  all           顺序执行：清理旧库/建表 → 导入 → 建索引 → recall
+                导入优先级：--s3-* / cfg.dataset.s3 > --csv > cfg.base_fbin (INSERT)
   create_table  仅创建表
   import        仅导入数据（默认走 .fbin INSERT；加 --csv 走 LOAD DATA LOCAL INFILE）
   create_index  仅创建向量索引
@@ -27,6 +28,9 @@ JSON 配置（cfg/*.json）示例：
 示例：
   # 全流程（INSERT 导入）
   python run_wiki.py all --config cfg/ivfpq_1M.json -n 5000 -k 100 --concurrency 32
+
+  # 全流程（S3）：dataset.s3 + cfg/s3_credentials.json（cp example 后填 AK/SK）
+  python run_wiki.py all --config cfg/ivfflat_10M.json -n 5000 -k 100 --concurrency 32
 
   # 预生成 CSV 并以 LOAD DATA 走全流程
   python run_wiki.py gen_csv --config cfg/ivfpq_1M.json --output /tmp/wiki_1M.csv
@@ -55,9 +59,16 @@ from run_vector_test import (  # noqa: E402
     run_eval,
     run_wiki_create_index,
     run_wiki_create_table,
-    run_wiki_import,
 )
-from gen import convert_fbin_to_csv, load_csv_into_matrixone  # noqa: E402
+from gen import convert_fbin_to_csv  # noqa: E402
+from s3_credentials import DEFAULT_S3_CREDENTIALS_FILE  # noqa: E402
+from wiki_pipeline import (  # noqa: E402
+    attach_dataset_fields,
+    run_all_pipeline,
+    run_import_step,
+    validate_import_paths,
+    validate_recall_paths,
+)
 
 
 COMMANDS = (
@@ -82,17 +93,16 @@ def build_args(cli) -> SimpleNamespace:
     apply_config_to_args(ns, cfg)
     ns._index_config = cfg
 
-    dataset = cfg.get("dataset", {}) or {}
-    raw_fbin = dataset.get("base_fbin")
-    if raw_fbin is None:
-        ns.fbin = None
-    elif isinstance(raw_fbin, str):
-        ns.fbin = [raw_fbin]
-    else:
-        ns.fbin = list(raw_fbin)
     ns.csv = cli.csv
-    ns.batch_size = cli.batch_size
-    ns.file_id_base = cli.file_id_base
+    ns.input_csv_prefix = getattr(cli, "input_csv_prefix", None)
+    ns.s3_endpoint = getattr(cli, "s3_endpoint", None)
+    ns.s3_bucket = getattr(cli, "s3_bucket", None)
+    ns.s3_filepath = getattr(cli, "s3_filepath", None)
+    ns.s3_region = getattr(cli, "s3_region", None)
+    ns.s3_compression = getattr(cli, "s3_compression", None)
+    ns.s3_access_key_id = getattr(cli, "s3_access_key_id", None)
+    ns.s3_secret_access_key = getattr(cli, "s3_secret_access_key", None)
+    ns.s3_credentials_file = getattr(cli, "s3_credentials_file", None)
 
     ns.sql_mode = cli.sql_mode
     ns.num_queries = cli.num_queries
@@ -102,73 +112,15 @@ def build_args(cli) -> SimpleNamespace:
     ns.duration = None
     ns.distribute_file_ids = False
     ns.max_distinct_file_ids = 50
-    ns.skip_db_verify = True
-    ns.probe = (cfg.get("env", {}) or {}).get("probe_limit")
     ns.filter_mode = cli.filter_mode
     ns.filter_file_id_base = cli.filter_file_id_base
     ns.filter_distinct_file_ids = cli.filter_distinct_file_ids
     ns.query_fbin = None
     ns.groundtruth_ibin = None
     ns.id_offset = None
+    attach_dataset_fields(ns, cfg)
 
     return ns
-
-
-def _resolve_input_csvs(cli) -> list[str] | None:
-    """根据 CLI 返回用于 LOAD DATA 的 CSV 路径列表；若未指定 CSV 路径返回 None。"""
-    if cli.csv:
-        return [cli.csv]
-    if cli.input_csv_prefix:
-        import glob as _glob
-        matched = sorted(_glob.glob(f"{cli.input_csv_prefix}*.csv"))
-        return matched
-    return None
-
-
-def _validate_import_paths(ns: SimpleNamespace, cli) -> int:
-    csvs = _resolve_input_csvs(cli)
-    if csvs is not None:
-        if not csvs:
-            print(f"错误: --input-csv-prefix 未匹配到 {cli.input_csv_prefix}*.csv")
-            return 1
-        for p in csvs:
-            if not os.path.exists(p):
-                print(f"错误: CSV 文件不存在: {p}")
-                return 1
-        return 0
-    # fbin 路径
-    if not ns.fbin:
-        print("错误: JSON 的 dataset.base_fbin 未设置，且未提供 --csv/--input-csv-prefix。")
-        return 1
-    for p in ns.fbin:
-        if not os.path.exists(p):
-            print(f"错误: base_fbin 文件不存在: {p}")
-            return 1
-    return 0
-
-
-def _validate_recall_paths(ns: SimpleNamespace) -> None:
-    ds = ns._index_config.get("dataset", {}) or {}
-    qf = ds.get("query_fbin")
-    gi = ds.get("groundtruth_ibin")
-    qf_ok = bool(qf) and os.path.exists(qf)
-    gi_ok = bool(gi) and os.path.exists(gi)
-    if not qf_ok:
-        print(
-            f"警告: dataset.query_fbin 未设置或不存在: {qf!r}。"
-            " 召回步骤将改走 DB 抽样 + 在线 ground truth。"
-        )
-    if not gi_ok:
-        print(
-            f"警告: dataset.groundtruth_ibin 未设置或不存在: {gi!r}。"
-            " 召回步骤将改走 DB 抽样 + 在线 ground truth。"
-        )
-    if qf_ok and gi_ok and getattr(ns, "filter_val", None) is not None:
-        print(
-            f"[run_wiki] 使用预计算 .ibin GT，本地按 file_id={ns.filter_val} "
-            f"(base={ns.filter_file_id_base}, distinct={ns.filter_distinct_file_ids}) "
-            f"过滤为 eligible recall@k。"
-        )
 
 
 def _banner(title: str) -> None:
@@ -176,27 +128,6 @@ def _banner(title: str) -> None:
     print("=" * 70)
     print(f"[run_wiki] {title}")
     print("=" * 70)
-
-
-def _make_import_fn(ns: SimpleNamespace, cli):
-    csvs = _resolve_input_csvs(cli)
-    if csvs is not None:
-        def _import_via_csv(ns_):
-            for p in csvs:
-                print(f"[run_wiki] LOAD DATA: {p}", flush=True)
-                load_csv_into_matrixone(
-                    csv_path=p,
-                    host=ns_.host,
-                    port=ns_.port,
-                    user=ns_.user,
-                    password=ns_.password,
-                    database=ns_.database,
-                    table=ns_.table,
-                )
-            return 0
-        suffix = f" x{len(csvs)}" if len(csvs) > 1 else ""
-        return f"import (csv LOAD DATA{suffix})", _import_via_csv
-    return "import", run_wiki_import
 
 
 def _gen_csv(ns: SimpleNamespace, cli) -> int:
@@ -322,6 +253,32 @@ def _build_parser() -> argparse.ArgumentParser:
         help="输入 CSV 前缀，匹配 {prefix}*.csv 全部 LOAD DATA（import/all 步骤）。",
     )
 
+    # S3 导入（优先级高于 --csv / base_fbin）
+    parser.add_argument("--s3-endpoint", default=None, help="S3/OSS endpoint，如 oss-cn-shanghai.aliyuncs.com")
+    parser.add_argument("--s3-bucket", default=None, help="S3 bucket 名")
+    parser.add_argument(
+        "--s3-filepath",
+        default=None,
+        help="对象路径，支持通配如 wiki/*.csv（相对 bucket）",
+    )
+    parser.add_argument("--s3-region", default=None, help="区域，如 oss-cn-shanghai")
+    parser.add_argument(
+        "--s3-compression",
+        default=None,
+        help="压缩格式：none / gzip / bz2 / lz4 / auto（默认 none）",
+    )
+    parser.add_argument(
+        "--s3-credentials-file",
+        default=DEFAULT_S3_CREDENTIALS_FILE,
+        help=f"S3 密钥 JSON 路径（默认: {DEFAULT_S3_CREDENTIALS_FILE}，勿提交仓库）",
+    )
+    parser.add_argument("--s3-access-key-id", default=None, help="Access Key（覆盖凭证文件）")
+    parser.add_argument(
+        "--s3-secret-access-key",
+        default=None,
+        help="Secret Key（覆盖凭证文件）",
+    )
+
     # gen_csv 专用
     parser.add_argument("-o", "--output", default=None, help="gen_csv 输出单个 CSV 路径")
     parser.add_argument(
@@ -373,9 +330,9 @@ def main() -> int:
         return _run_step("create-table", run_wiki_create_table)
 
     if cmd == "import":
-        if _validate_import_paths(ns, cli):
+        if validate_import_paths(ns):
             return 1
-        label, fn = _make_import_fn(ns, cli)
+        label, fn = run_import_step(ns, log_prefix="[run_wiki]")
         return _run_step(label, fn)
 
     if cmd == "create_index":
@@ -385,29 +342,11 @@ def main() -> int:
         return _run_step("drop-index", _drop_index)
 
     if cmd == "recall":
-        _validate_recall_paths(ns)
+        validate_recall_paths(ns)
         return _run_step("run (recall)", run_eval)
 
     # cmd == "all"
-    if _validate_import_paths(ns, cli):
-        return 1
-    _validate_recall_paths(ns)
-
-    if _run_step("1/4  create-table", run_wiki_create_table):
-        return 1
-    label, fn = _make_import_fn(ns, cli)
-    if _run_step(f"2/4  {label}", fn):
-        return 1
-    if _run_step("3/4  create-index", run_wiki_create_index):
-        return 1
-    rc = _run_step("4/4  run (recall)", run_eval)
-
-    _banner("完成：步骤耗时")
-    for lbl, elapsed in timings.items():
-        print(f"  {lbl:<28} {elapsed:8.2f} s")
-    total = sum(timings.values())
-    print(f"  {'TOTAL':<28} {total:8.2f} s")
-    return rc
+    return run_all_pipeline(ns, log_prefix="[run_wiki]")
 
 
 if __name__ == "__main__":

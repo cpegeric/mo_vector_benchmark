@@ -108,7 +108,7 @@ python run_vector_test.py --host 192.168.1.100 --database mydb wiki setup \
 ```
 
 **注意**：`--fbin` 参数只需指定一次，工具会自动完成创建表、导入数据、创建索引三个步骤。如果只需要执行其中某一步，可使用 `--create-table` 或 `--create-index` 参数。
-**注意**：wiki setup 导入wiki_all采用批量加载方式，时间相对较长，如果想要快速加载数据，也可以手动用load data s3的方式加载更快,联系我获取csv s3 path
+**注意**：wiki setup 导入 wiki_all 采用批量 INSERT，耗时较长。推荐用 `run_wiki.py all` + S3 `LOAD DATA`（见下节），百万级数据可在秒级完成导入。
 
 #### 3.1 子命令入口 `run_wiki.py`（推荐）
 
@@ -120,7 +120,7 @@ python run_wiki.py <command> --config cfg/xxx.json [options]
 
 | 命令 | 说明 |
 |------|------|
-| `all` | 顺序执行 create_table → import → create_index → recall |
+| `all` | 顺序执行：清理旧库/建表 → 导入 → 建索引 → recall（导入支持 S3 / CSV / fbin） |
 | `create_table` | 仅创建表 |
 | `import` | 仅导入数据；默认走 `.fbin` INSERT，加 `--csv PATH` 或 `--input-csv-prefix PREFIX` 改走 LOAD DATA INFILE（显著更快） |
 | `create_index` | 仅创建向量索引（读取 `cfg.index` 与 `cfg.env`） |
@@ -149,6 +149,16 @@ python run_wiki.py <command> --config cfg/xxx.json [options]
 ```bash
 # 全流程（INSERT 导入）
 python run_wiki.py all --config cfg/ivfpq_1M.json -n 5000 -k 100 --concurrency 32
+
+# 全流程（S3 LOAD DATA，一步完成：清库建表 → S3 导入 → IVF 索引 → recall）
+# run_vector_test.py 与 run_wiki.py 等价（均需 --config + cfg/s3_credentials.json）
+python run_vector_test.py --config cfg/ivfflat_10M.json all -n 5000 -k 100 --concurrency 32
+python run_wiki.py all --config cfg/ivfflat_10M.json -n 5000 -k 100 --concurrency 32
+# 方式 B：CLI 传 S3 参数（密钥见统一凭证文件，见下）
+python run_wiki.py all --config cfg/ivfflat_1M.json \
+  --s3-endpoint oss-cn-shanghai.aliyuncs.com \
+  --s3-bucket my-bucket --s3-filepath wiki/wiki_1M.csv \
+  --s3-region oss-cn-shanghai -n 5000 -k 100 --concurrency 32
 
 # 先生成单个 CSV，再用 LOAD DATA 走全流程（百万级数据导入从分钟级降到秒级）
 python run_wiki.py gen_csv --config cfg/ivfpq_1M.json --output /tmp/wiki_1M.csv
@@ -189,6 +199,10 @@ file_id = file_id_base + (row_idx - 1) % distinct_file_ids
 | 参数 | 适用命令 | 说明 |
 |------|---------|------|
 | `--config` | 全部 | JSON 配置文件路径（必填） |
+| `dataset.s3` | `all` / `import` | JSON 内 S3 块：`endpoint`/`bucket`/`filepath`/`region`/`compression`（不含密钥时从凭证文件读） |
+| `cfg/s3_credentials.json` | `all` / `import` | **统一 S3 密钥**（复制 `cfg/s3_credentials.example.json` 后填写，已加入 `.gitignore`） |
+| `--s3-credentials-file` | `all` / `import` | 自定义密钥文件路径（默认 `cfg/s3_credentials.json`） |
+| `--s3-endpoint` 等 | `all` / `import` | CLI 覆盖 JSON 的 S3 连接参数；`--s3-access-key-id` 可临时覆盖凭证文件 |
 | `--csv PATH` | `all` / `import` | 走 LOAD DATA 路径的单个 CSV 文件 |
 | `--input-csv-prefix PREFIX` | `all` / `import` | 匹配 `{PREFIX}*.csv`，按顺序逐个 LOAD DATA |
 | `-o, --output PATH` | `gen_csv` | 输出单个 CSV 路径 |
@@ -205,6 +219,15 @@ file_id = file_id_base + (row_idx - 1) % distinct_file_ids
 > `run_wiki.py` 会自动从 `cfg.env.probe_limit` 设置 IVF 查询的 probe 参数，无需手动传 `--probe`，与 `vector_benchmark/gtrecall.py` 的默认行为一致。
 >
 > `LOAD DATA INFILE`（非 `LOCAL`）由 MatrixOne 服务端读取 CSV，CSV 文件必须放在服务端可访问的路径。若 MO 与脚本不在同一台机器，需先把 CSV 拷贝到 MO 所在机器。
+
+**S3 凭证（统一文件）**
+
+```bash
+cp cfg/s3_credentials.example.json cfg/s3_credentials.json
+# 编辑 cfg/s3_credentials.json，填入 access_key_id / secret_access_key
+```
+
+密钥读取顺序：CLI `--s3-access-key-*` > `dataset.s3` 内联 > `cfg/s3_credentials.json` > 环境变量 `MO_S3_ACCESS_KEY_ID` / `MO_S3_SECRET_ACCESS_KEY`（兼容旧用法）。
 
 表结构：
 

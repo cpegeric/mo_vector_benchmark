@@ -11,6 +11,7 @@ Wiki-all 向量数据集测试工具
   wiki create-index      - 创建向量索引（支持 JSON 配置驱动 cagra/ivfpq/ivfflat/hnsw）
   wiki test              - 运行搜索测试
   wiki setup             - 一键设置（创建表+导入+建索引+测试）
+  all                    - 一键全流程（需 --config：清库建表→S3/CSV/fbin导入→建索引→recall）
   ann                    - 生成 ANN 评测文件
   run                    - 运行召回率/QPS 评估
 
@@ -50,8 +51,10 @@ Wiki-all 向量数据集测试工具
   # 一键完整流程（自动创建表、导入数据、创建索引）
   python run_vector_test.py wiki setup --fbin /path/to/wiki_all_1M.fbin --ivf-lists 100
 
-  # 更简洁的子命令入口（从 JSON dataset 块读取 base/query/groundtruth 路径）
-  python run_wiki.py all --config cfg/cagra.json -n 1000 -k 10 --concurrency 4
+  # 一键全流程（cfg + S3，与 run_wiki.py all 等价）
+  python run_vector_test.py --config cfg/ivfflat_10M.json all -n 5000 -k 100 --concurrency 32
+
+  # 等价入口：run_wiki.py all --config cfg/ivfflat_10M.json ...
   # 其他子命令：create_table / import / create_index / drop_index / gen_csv / recall
 
 数据集信息:
@@ -564,6 +567,13 @@ def run_eval(args):
     return result.returncode
 
 
+def run_all(args):
+    """一键全流程：清库建表 → S3/CSV/fbin 导入 → 建索引 → recall（需 --config）。"""
+    from wiki_pipeline import run_all_pipeline
+
+    return run_all_pipeline(args, log_prefix="[run_vector_test]")
+
+
 def run_wiki_setup(args):
     """一键设置: 创建表、导入数据、创建索引、测试"""
     print("=" * 70)
@@ -673,6 +683,9 @@ def main():
 
   # 一键流程+测试
   python run_vector_test.py wiki setup --fbin /path/to/wiki_all_1M.fbin --ivf-lists 100 --auto-test -n 1000
+
+  # 一键全流程（cfg/ivfflat_10M.json：dataset.s3 + cfg/s3_credentials.json）
+  python run_vector_test.py --config cfg/ivfflat_10M.json all -n 5000 -k 100 --concurrency 32
         """,
     )
 
@@ -689,6 +702,65 @@ def main():
     )
 
     subparsers = parser.add_subparsers(dest="command", help="可用命令")
+
+    def _add_recall_args(p):
+        p.add_argument("-n", "--num-queries", type=int, default=1000, help="查询数量（默认: 1000）")
+        p.add_argument("-k", "--k", type=int, default=10, help="Top-K（默认: 10）")
+        p.add_argument("--concurrency", type=int, default=4, help="并发数（默认: 4）")
+        p.add_argument(
+            "--sql-mode",
+            choices=["l2_only", "l2_filter", "l2_filter_threshold"],
+            default="l2_only",
+            help="SQL 模式（默认: l2_only）",
+        )
+        p.add_argument(
+            "--filter-val",
+            type=int,
+            help="file_id 过滤值（l2_filter / l2_filter_threshold 必填）",
+        )
+        p.add_argument(
+            "--filter-mode",
+            choices=["pre", "post", "force", "include"],
+            help="过滤执行方式（可选）",
+        )
+        p.add_argument(
+            "--filter-file-id-base",
+            type=int,
+            default=20000000,
+            help="本地 GT 过滤 file_id_base（默认: 20000000）",
+        )
+        p.add_argument(
+            "--filter-distinct-file-ids",
+            type=int,
+            default=50,
+            help="本地 GT 过滤 distinct_file_ids（默认: 50）",
+        )
+
+    def _add_import_args(p):
+        p.add_argument("--batch-size", type=int, default=20000, help="fbin INSERT 批量大小")
+        p.add_argument("--file-id-base", type=int, default=20000000, help="file_id 起始值")
+        p.add_argument("--csv", help="本地 CSV，LOAD DATA INFILE（优先级低于 S3）")
+        p.add_argument("--input-csv-prefix", help="匹配 {prefix}*.csv 逐个 LOAD DATA")
+        p.add_argument("--s3-endpoint", help="S3/OSS endpoint（覆盖 cfg.dataset.s3）")
+        p.add_argument("--s3-bucket", help="S3 bucket")
+        p.add_argument("--s3-filepath", help="S3 对象路径，支持通配")
+        p.add_argument("--s3-region", help="S3 region")
+        p.add_argument("--s3-compression", help="压缩：none/gzip/bz2/lz4/auto")
+        p.add_argument(
+            "--s3-credentials-file",
+            default=None,
+            help="S3 密钥 JSON（默认 cfg/s3_credentials.json）",
+        )
+        p.add_argument("--s3-access-key-id", help="覆盖凭证文件中的 AK")
+        p.add_argument("--s3-secret-access-key", help="覆盖凭证文件中的 SK")
+
+    # ===== all 命令（一键全流程，需 --config）=====
+    all_parser = subparsers.add_parser(
+        "all",
+        help="一键全流程：清库建表 → S3/CSV/fbin 导入 → 建索引 → recall（需 --config）",
+    )
+    _add_recall_args(all_parser)
+    _add_import_args(all_parser)
 
     # ===== wiki 命令 =====
     wiki_parser = subparsers.add_parser(
@@ -765,12 +837,25 @@ def main():
 
     args = parser.parse_args()
 
+    if args.command == "all" and not getattr(args, "config", None):
+        print("错误: all 命令必须指定 --config cfg/xxx.json")
+        return 2
+
     cfg = load_index_config(getattr(args, "config", None))
     if cfg:
         apply_config_to_args(args, cfg)
         args._index_config = cfg
 
-    if args.command == "wiki":
+    if args.command == "all":
+        needs_filter = args.sql_mode in ("l2_filter", "l2_filter_threshold")
+        if needs_filter and args.filter_val is None:
+            print(f"错误: --sql-mode {args.sql_mode} 需要 --filter-val=<file_id>")
+            return 2
+        from wiki_pipeline import attach_dataset_fields
+
+        attach_dataset_fields(args, cfg)
+        return run_all(args)
+    elif args.command == "wiki":
         return run_wiki(args)
     elif args.command == "ann":
         return run_ann(args)

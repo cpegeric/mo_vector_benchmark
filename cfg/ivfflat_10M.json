@@ -18,6 +18,13 @@
     "ivf_preload_entries": 0
   },
   "dataset": {
+    "s3": {
+      "endpoint": "http://cos.ap-guangzhou.myqcloud.com",
+      "bucket": "mo-load-guangzhou-1308875761",
+      "filepath": "vector/wiki_all_10m/historical_file_blocks_wiki_all_10m.csv",
+      "region": "ap-guangzhou",
+      "compression": "none"
+    },
     "base_fbin": ["/home/ubuntu/github/vector_benchmark/wiki_all_10M/base.10M.fbin"],
     "query_fbin": "/home/ubuntu/github/vector_benchmark/wiki_all_10M/queries.fbin",
     "groundtruth_ibin": "/home/ubuntu/github/vector_benchmark/wiki_all_10M/groundtruth.10M.neighbors.ibin",

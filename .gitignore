@@ -1,0 +1,5 @@
+# S3/OSS 密钥（从 s3_credentials.example.json 复制后填写，勿提交）
+cfg/s3_credentials.json
+
+__pycache__/
+*.pyc

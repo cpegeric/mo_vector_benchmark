@@ -278,6 +278,76 @@ def convert_fbin_to_csv(
     return outputs
 
 
+def _escape_s3option_value(value: str) -> str:
+    """转义 s3option 中单引号包裹的字符串值。"""
+    return str(value).replace("\\", "\\\\").replace("'", "\\'")
+
+
+def build_s3option_sql_fragment(s3: dict) -> str:
+    """将 S3 连接参数转为 MatrixOne LOAD DATA URL s3option{...} 片段。"""
+    required = ("endpoint", "access_key_id", "secret_access_key", "bucket", "filepath", "region")
+    missing = [k for k in required if not s3.get(k)]
+    if missing:
+        raise ValueError(f"S3 配置缺少必填字段: {', '.join(missing)}")
+
+    compression = s3.get("compression") or "none"
+    parts = []
+    for key in (*required, "compression"):
+        val = compression if key == "compression" else s3[key]
+        parts.append(f'"{key}"=\'{_escape_s3option_value(val)}\'')
+    return "s3option{" + ", ".join(parts) + "}"
+
+
+def load_s3_into_matrixone(
+    s3: dict,
+    host: str,
+    port: int,
+    user: str,
+    password: str,
+    database: str,
+    table: str,
+) -> None:
+    """从 S3 兼容对象存储 LOAD DATA 导入 CSV（与 load_csv_into_matrixone 字段格式一致）。"""
+    try:
+        import pymysql
+    except ImportError:
+        print("需要 pymysql: pip install pymysql", file=sys.stderr)
+        sys.exit(1)
+
+    tbl = f"`{table}`"
+    s3_frag = build_s3option_sql_fragment(s3)
+    sql = (
+        f"LOAD DATA URL {s3_frag} "
+        f"INTO TABLE {tbl} "
+        f"FIELDS TERMINATED BY ',' "
+        f"ENCLOSED BY '\"' "
+        f"LINES TERMINATED BY '\\r\\n' "
+        f"IGNORE 1 LINES "
+        f"PARALLEL 'true'"
+    )
+    print(f"执行：{sql}", file=sys.stderr)
+    conn = pymysql.connect(
+        host=host,
+        port=port,
+        user=user,
+        password=password,
+        database=database,
+        charset="utf8mb4",
+        autocommit=False,
+        connect_timeout=120,
+        read_timeout=3600,
+        write_timeout=3600,
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            affected = cur.rowcount
+        conn.commit()
+        print(f"LOAD DATA (S3) 完成：affected_rows={affected}", file=sys.stderr)
+    finally:
+        conn.close()
+
+
 def load_csv_into_matrixone(
     csv_path: str,
     host: str,
