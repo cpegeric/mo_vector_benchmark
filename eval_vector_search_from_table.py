@@ -138,6 +138,27 @@ NUM_QUERIES = 10000   # 默认抽样/评测条数；与 --duration 同时用时�
 
 # ===== 工具函数 =====
 
+def apply_db_connection(
+    host: Optional[str] = None,
+    port: Optional[int] = None,
+    user: Optional[str] = None,
+    password: Optional[str] = None,
+    database: Optional[str] = None,
+) -> None:
+    """用 CLI / 调用方传入的值覆盖 DB_CONFIG（未传的项保持原样）。"""
+    if host is not None:
+        DB_CONFIG["host"] = host
+    if port is not None:
+        DB_CONFIG["port"] = int(port)
+    if user is not None:
+        DB_CONFIG["user"] = user
+    if password is not None:
+        DB_CONFIG["password"] = password
+    if database is not None:
+        DB_CONFIG["database"] = database
+        refresh_sql_mode_templates()
+
+
 def get_conn():
     return pymysql.connect(**DB_CONFIG)
 
@@ -1433,7 +1454,7 @@ def evaluate(
     skip_recall: bool = False,
 ):
     if database:
-        DB_CONFIG["database"] = database
+        apply_db_connection(database=database)
     # 每次评测前重新读取 sql_config_simple.json（阈值、预检最小行数等）
     load_sql_config_simple()
     refresh_sql_mode_templates()
@@ -2113,6 +2134,30 @@ def parse_args() -> argparse.Namespace:
         help="number of concurrent workers for testing (default: 1, serial execution)",
     )
     parser.add_argument(
+        "--host",
+        type=str,
+        default=None,
+        help="覆盖 DB_CONFIG 中的主机（默认 127.0.0.1）",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="覆盖 DB_CONFIG 中的端口（默认 6001）",
+    )
+    parser.add_argument(
+        "--user",
+        type=str,
+        default=None,
+        help="覆盖 DB_CONFIG 中的用户名",
+    )
+    parser.add_argument(
+        "--password",
+        type=str,
+        default=None,
+        help="覆盖 DB_CONFIG 中的密码",
+    )
+    parser.add_argument(
         "--database",
         type=str,
         default=None,
@@ -2223,6 +2268,13 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
+    apply_db_connection(
+        host=args.host,
+        port=args.port,
+        user=args.user,
+        password=args.password,
+        database=args.database,
+    )
     # 如果指定了表名，更新全局表名变量
     if args.table:
         TABLE_NAME = args.table
@@ -2246,7 +2298,7 @@ if __name__ == "__main__":
         concurrency=args.concurrency,
         duration=args.duration,
         annfiles_only=args.annfiles_only,
-        database=args.database,
+        database=None,
         mode23_filter_value=args.mode23_filter,
         skip_db_verify=args.skip_db_verify,
         ann_distribute_file_ids=args.ann_distribute_file_ids,

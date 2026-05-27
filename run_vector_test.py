@@ -433,13 +433,13 @@ def run_wiki_test(args):
     cmd.extend(["--k", str(args.k)])
     cmd.extend(["--num-queries", str(args.num_queries)])
     cmd.extend(["--concurrency", str(args.concurrency)])
-    cmd.extend(["--database", args.database])
+    extend_eval_db_connection_cmd(args, cmd)
     cmd.extend(["--table", args.table])
 
     # S2/S3 过滤值
     if filter_val:
         cmd.extend(["--mode23-filter", str(filter_val)])
-
+    
     # 跳过数据库验证
     cmd.append("--skip-db-verify")
 
@@ -549,6 +549,20 @@ def resolve_recall_dataset_paths(args) -> dict:
     return apply_gt_source(paths, resolve_gt_source(args))
 
 
+def extend_eval_db_connection_cmd(args, cmd: list) -> None:
+    """把 JSON/args 中的连库参数追加到 eval 子进程命令行。"""
+    for flag, attr in (
+        ("--host", "host"),
+        ("--port", "port"),
+        ("--user", "user"),
+        ("--password", "password"),
+        ("--database", "database"),
+    ):
+        val = getattr(args, attr, None)
+        if val is not None and val != "":
+            cmd.extend([flag, str(val)])
+
+
 def extend_eval_recall_dataset_cmd(args, cmd: list) -> Optional[str]:
     """把选定来源的 GT 路径追加到 eval 命令行；失败返回错误信息。"""
     try:
@@ -592,9 +606,7 @@ def run_ann(args):
     cmd.extend(["--num-queries", str(args.num_queries)])
     cmd.extend(["--concurrency", str(args.concurrency)])
 
-    # 数据库配置
-    if args.database:
-        cmd.extend(["--database", args.database])
+    extend_eval_db_connection_cmd(args, cmd)
 
     # 表名
     if hasattr(args, 'table') and args.table:
@@ -636,9 +648,7 @@ def run_eval(args):
     cmd.extend(["--num-queries", str(args.num_queries)])
     cmd.extend(["--concurrency", str(args.concurrency)])
 
-    # 数据库配置
-    if args.database:
-        cmd.extend(["--database", args.database])
+    extend_eval_db_connection_cmd(args, cmd)
 
     # 表名
     if hasattr(args, 'table') and args.table:
