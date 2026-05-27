@@ -272,23 +272,18 @@ def _banner(title: str, log_prefix: str) -> None:
     print("=" * 70)
 
 
-def run_all_pipeline(args: Any, log_prefix: str = "[all]") -> int:
-    """清库建表 → 导入 → 建索引 → recall。"""
+def run_setup_pipeline(args: Any, log_prefix: str = "[setup]") -> int:
+    """清库建表 → 导入 → 建索引（不跑 recall）。"""
     cfg = getattr(args, "_index_config", None)
     if not cfg:
-        print("错误: 全流程需要 --config cfg/xxx.json（含 index / env / dataset）")
+        print("错误: 需要 --config cfg/xxx.json（含 index / env / dataset）")
         return 2
 
     attach_dataset_fields(args, cfg)
     if validate_import_paths(args):
         return 1
-    validate_recall_paths(args)
 
-    from run_vector_test import (
-        run_eval,
-        run_wiki_create_index,
-        run_wiki_create_table,
-    )
+    from run_vector_test import run_wiki_create_index, run_wiki_create_table
 
     timings: dict[str, float] = {}
 
@@ -301,20 +296,39 @@ def run_all_pipeline(args: Any, log_prefix: str = "[all]") -> int:
             print(f"{log_prefix} 步骤失败: {label} (rc={rc})")
         return rc
 
-    if _run_step("1/5  drop-db + create-table", lambda: run_wiki_create_table(args)):
+    if _run_step("1/3  drop-db + create-table", lambda: run_wiki_create_table(args)):
         return 1
 
     import_label, import_fn = run_import_step(args, log_prefix=log_prefix)
-    if _run_step(f"2/5  {import_label}", import_fn):
+    if _run_step(f"2/3  {import_label}", import_fn):
         return 1
 
-    if _run_step("3/5  create-index", lambda: run_wiki_create_index(args)):
-        return 1
-
-    rc = _run_step("5/5  run (recall)", lambda: run_eval(args))
+    rc = _run_step("3/3  create-index", lambda: run_wiki_create_index(args))
 
     _banner("完成：步骤耗时", log_prefix)
     for lbl, elapsed in timings.items():
         print(f"  {lbl:<32} {elapsed:8.2f} s")
     print(f"  {'TOTAL':<32} {sum(timings.values()):8.2f} s")
+    return rc
+
+
+def run_all_pipeline(args: Any, log_prefix: str = "[all]") -> int:
+    """清库建表 → 导入 → 建索引 → recall。"""
+    validate_recall_paths(args)
+    rc = run_setup_pipeline(args, log_prefix=log_prefix)
+    if rc:
+        return rc
+
+    from run_vector_test import run_eval
+
+    log_prefix = log_prefix if log_prefix != "[setup]" else "[all]"
+    timings: dict[str, float] = {}
+
+    _banner("4/4  run (recall)", log_prefix)
+    t0 = time.perf_counter()
+    rc = run_eval(args)
+    elapsed = time.perf_counter() - t0
+    if rc:
+        print(f"{log_prefix} 步骤失败: run (recall) (rc={rc})")
+    print(f"{log_prefix} recall 耗时 {elapsed:.2f} s")
     return rc

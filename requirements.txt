@@ -1,0 +1,3 @@
+# vector_benchmark — Python 3.10+ 推荐
+numpy>=1.21,<3
+pymysql>=1.0

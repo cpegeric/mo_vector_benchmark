@@ -7,6 +7,7 @@ run_wiki.py — Wiki-all 基准测试子命令入口
 
 命令：
   all           顺序执行：清理旧库/建表 → 导入 → 建索引 → recall
+  setup         仅前三步：清理旧库/建表 → 导入(S3/CSV/fbin) → 建索引（不跑 recall）
                 导入优先级：--s3-* / cfg.dataset.s3 > --csv > cfg.base_fbin (INSERT)
   create_table  仅创建表
   import        仅导入数据（默认走 .fbin INSERT；加 --csv 走 LOAD DATA LOCAL INFILE）
@@ -31,6 +32,9 @@ JSON 配置（cfg/*.json）示例：
 示例：
   # 全流程（INSERT 导入）
   python run_wiki.py all --config cfg/ivfpq_1M.json -n 5000 -k 100 --concurrency 32
+
+  # 仅建表 + S3 导入 + 建索引（不跑 recall）
+  python run_wiki.py setup --config cfg/ivfflat_10M.json
 
   # 全流程（S3）：dataset.s3 + cfg/s3_credentials.json（cp example 后填 AK/SK）
   python run_wiki.py all --config cfg/ivfflat_10M.json -n 5000 -k 100 --concurrency 32
@@ -76,6 +80,7 @@ from wiki_pipeline import (  # noqa: E402
     attach_dataset_fields,
     run_all_pipeline,
     run_import_step,
+    run_setup_pipeline,
     validate_import_paths,
     validate_recall_paths,
 )
@@ -83,6 +88,7 @@ from wiki_pipeline import (  # noqa: E402
 
 COMMANDS = (
     "all",
+    "setup",
     "create_table",
     "import",
     "create_index",
@@ -392,6 +398,9 @@ def main() -> int:
     if cmd == "recall":
         validate_recall_paths(ns)
         return _run_step("run (recall)", run_eval)
+
+    if cmd == "setup":
+        return run_setup_pipeline(ns, log_prefix="[run_wiki]")
 
     # cmd == "all"
     return run_all_pipeline(ns, log_prefix="[run_wiki]")

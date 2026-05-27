@@ -121,6 +121,7 @@ python run_wiki.py <command> --config cfg/xxx.json [options]
 | 命令 | 说明 |
 |------|------|
 | `all` | 顺序执行：清理旧库/建表 → 导入 → 建索引 → recall（导入支持 S3 / CSV / fbin） |
+| `setup` | 仅前三步：清理旧库/建表 → 导入 → 建索引（**不跑 recall**） |
 | `create_table` | 仅创建表 |
 | `import` | 仅导入数据；默认走 `.fbin` INSERT，加 `--csv PATH` 或 `--input-csv-prefix PREFIX` 改走 LOAD DATA INFILE（显著更快） |
 | `create_index` | 仅创建向量索引（读取 `cfg.index` 与 `cfg.env`） |
@@ -149,6 +150,9 @@ python run_wiki.py <command> --config cfg/xxx.json [options]
 ```bash
 # 全流程（INSERT 导入）
 python run_wiki.py all --config cfg/ivfpq_1M.json -n 5000 -k 100 --concurrency 32
+
+# 仅建表 + S3 导入 + 建索引（不跑 recall）
+python run_wiki.py setup --config cfg/ivfflat_10M.json
 
 # 全流程（S3 LOAD DATA，一步完成：清库建表 → S3 导入 → IVF 索引 → recall）
 # run_vector_test.py 与 run_wiki.py 等价（均需 --config + cfg/s3_credentials.json）
