@@ -138,6 +138,27 @@ NUM_QUERIES = 10000   # 默认抽样/评测条数；与 --duration 同时用时�
 
 # ===== 工具函数 =====
 
+def apply_db_connection(
+    host: Optional[str] = None,
+    port: Optional[int] = None,
+    user: Optional[str] = None,
+    password: Optional[str] = None,
+    database: Optional[str] = None,
+) -> None:
+    """用 CLI / 调用方传入的值覆盖 DB_CONFIG（未传的项保持原样）。"""
+    if host is not None:
+        DB_CONFIG["host"] = host
+    if port is not None:
+        DB_CONFIG["port"] = int(port)
+    if user is not None:
+        DB_CONFIG["user"] = user
+    if password is not None:
+        DB_CONFIG["password"] = password
+    if database is not None:
+        DB_CONFIG["database"] = database
+        refresh_sql_mode_templates()
+
+
 def get_conn():
     return pymysql.connect(**DB_CONFIG)
 
@@ -249,6 +270,20 @@ def mode_int_to_str(mode_int: int) -> str:
     return mode_map[mode_int]
 
 
+def mode_eval_description(mode: str) -> str:
+    """评测启动日志文案（使用当前 TABLE_NAME / FILTER_COL，与 --table 一致）。"""
+    t = TABLE_NAME
+    if mode == "l2_only":
+        return f"S1：l2_distance 全表 Top-K（{t}）"
+    if mode == "l2_filter":
+        return f"S2：`{FILTER_COL}` 过滤 + L2 Top-K（{t}）"
+    if mode == "l2_filter_threshold":
+        return (
+            f"S3：`{FILTER_COL}` + L2<={S3_L2_DISTANCE_MAX} + Top-K（{t}）"
+        )
+    return mode
+
+
 def sample_query_vectors(
     conn,
     num_queries: int,
@@ -256,7 +291,7 @@ def sample_query_vectors(
     filter_val: Optional[Any] = None,
 ) -> List:
     """
-    S1：从 historical_file_blocks_cos 随机抽 embedding。
+    S1：从当前表（TABLE_NAME）随机抽 embedding。
     S2/S3：**在与 GT 相同的** `{FILTER_COL}`（如 file_id）分区内抽 embedding，
     避免查询向量来自其它 file_id 导致 l2 阈值下 GT 全空。
     """
@@ -1109,6 +1144,18 @@ def get_index_result_ids(
     return [row_to_eval_id(r) for r in rows]
 
 
+def _result_ids_for_gt_compare(res: List[str], gt_ids: List[str]) -> List[str]:
+    """
+    与 GT 对齐后再比 recall：
+    - ann id_mapping：row_id 为 file_id\\tid，保留 SQL 的 file_id\\tid；
+    - cuVS .ibin GT：仅为数字 id，SQL 结果去掉 file_id 前缀。
+    """
+    sample = next((g for g in gt_ids if g), None)
+    if sample and "\t" in str(sample):
+        return res
+    return [r.split("\t")[-1] for r in res]
+
+
 def evaluate_single_query_with_precomputed_gt(
     vec_literal: str,
     gt_ids: List[str],
@@ -1134,9 +1181,8 @@ def evaluate_single_query_with_precomputed_gt(
         filter_mode=filter_mode,
     )
     latency = time.perf_counter() - t0
-    # wiki_all 文件 GT（.ibin）只含 id；此处剥离 SQL 结果里的 "file_id\\t" 前缀
-    res_ids_only = [r.split("\t")[-1] for r in res]
-    r = eligible_recall_at_k(gt_ids, res_ids_only, k)
+    res_for_cmp = _result_ids_for_gt_compare(res, gt_ids)
+    r = eligible_recall_at_k(gt_ids, res_for_cmp, k)
     return r, gt_ids, vec_literal, latency
 
 
@@ -1433,7 +1479,7 @@ def evaluate(
     skip_recall: bool = False,
 ):
     if database:
-        DB_CONFIG["database"] = database
+        apply_db_connection(database=database)
     # 每次评测前重新读取 sql_config_simple.json（阈值、预检最小行数等）
     load_sql_config_simple()
     refresh_sql_mode_templates()
@@ -1499,20 +1545,17 @@ def evaluate(
                 f"改为使用表中至多 {ann_max_distinct_file_ids or '全部'} 个 DISTINCT `{FILTER_COL}`。"
             )
 
-    mode_names = {
-        "l2_only": "S1：cosine_similarity 全表 Top-K（historical_file_blocks_cos）",
-        "l2_filter": "S2：file_id 过滤 + L2 Top-K（historical_file_blocks）",
-        "l2_filter_threshold": (
-            f"S3：file_id + L2<={S3_L2_DISTANCE_MAX} + Top-K（historical_file_blocks）"
-        ),
-    }
+    mode_desc = mode_eval_description(mode)
     if duration:
         print(
-            f"running evaluate with mode={mode} ({mode_names.get(mode, mode)}), k={k}, "
+            f"running evaluate with mode={mode} ({mode_desc}), k={k}, "
             f"duration={duration}s (vector pool size={num_queries}), concurrency={concurrency}"
         )
     else:
-        print(f"running evaluate with mode={mode} ({mode_names.get(mode, mode)}), k={k}, num_queries={num_queries}, concurrency={concurrency}")
+        print(
+            f"running evaluate with mode={mode} ({mode_desc}), k={k}, "
+            f"num_queries={num_queries}, concurrency={concurrency}"
+        )
     # 1. 决定查询向量与 ground truth 的来源
     precomputed_gt_ids: Optional[List[List[str]]] = None
     per_query_filters_opt: Optional[List[Any]] = None
@@ -2054,7 +2097,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="l2_only",
         choices=["l2_only", "l2_filter", "l2_filter_threshold"],
-        help="l2_only=S1 cosine Top-K；l2_filter=S2 file_id+L2；l2_filter_threshold=S3 同上且 l2 距离阈值见 sql_config_simple.json",
+        help="l2_only=S1 全表 l2_distance Top-K；l2_filter=S2 file_id+L2；l2_filter_threshold=S3 同上且 l2 距离阈值见 sql_config_simple.json",
     )
     parser.add_argument(
         "--table",
@@ -2111,6 +2154,30 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="number of concurrent workers for testing (default: 1, serial execution)",
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default=None,
+        help="覆盖 DB_CONFIG 中的主机（默认 127.0.0.1）",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="覆盖 DB_CONFIG 中的端口（默认 6001）",
+    )
+    parser.add_argument(
+        "--user",
+        type=str,
+        default=None,
+        help="覆盖 DB_CONFIG 中的用户名",
+    )
+    parser.add_argument(
+        "--password",
+        type=str,
+        default=None,
+        help="覆盖 DB_CONFIG 中的密码",
     )
     parser.add_argument(
         "--database",
@@ -2223,6 +2290,13 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
+    apply_db_connection(
+        host=args.host,
+        port=args.port,
+        user=args.user,
+        password=args.password,
+        database=args.database,
+    )
     # 如果指定了表名，更新全局表名变量
     if args.table:
         TABLE_NAME = args.table
@@ -2246,7 +2320,7 @@ if __name__ == "__main__":
         concurrency=args.concurrency,
         duration=args.duration,
         annfiles_only=args.annfiles_only,
-        database=args.database,
+        database=None,
         mode23_filter_value=args.mode23_filter,
         skip_db_verify=args.skip_db_verify,
         ann_distribute_file_ids=args.ann_distribute_file_ids,
