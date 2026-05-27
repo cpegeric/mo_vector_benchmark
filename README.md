@@ -230,12 +230,28 @@ python run_wiki.py recall --config cfg/ivfflat_10M.json --gt-source ann \\
 "gt_source": "ann",
 "ann_s3": {
   "prefix": "vector/wiki_ann/ivfflat_10m",
-  "query_fvecs": "query_l2_only_k100.fvecs",
-  "groundtruth_ivecs": "groundtruth_l2_only_k100.ivecs",
-  "id_mapping": "id_mapping_l2_only_k100.txt",
-  "local_dir": "/tmp/wiki_ann_ivfflat_10m"
+  "local_dir": "/tmp/wiki_ann_ivfflat_10m",
+  "l2_only": {
+    "query_fvecs": "query_l2_only_k100.fvecs",
+    "groundtruth_ivecs": "groundtruth_l2_only_k100.ivecs",
+    "id_mapping": "id_mapping_l2_only_k100.txt"
+  },
+  "l2_filter": {
+    "query_fvecs": "query_l2_filter_k100.fvecs",
+    "groundtruth_ivecs": "groundtruth_l2_filter_k100.ivecs",
+    "id_mapping": "id_mapping_l2_filter_k100.txt",
+    "query_filters": "query_l2_filter_k100.filters.txt"
+  },
+  "l2_filter_threshold": {
+    "query_fvecs": "query_l2_filter_threshold_k100.fvecs",
+    "groundtruth_ivecs": "groundtruth_l2_filter_threshold_k100.ivecs",
+    "id_mapping": "id_mapping_l2_filter_threshold_k100.txt",
+    "query_filters": "query_l2_filter_threshold_k100.filters.txt"
+  }
 }
 ```
+
+`recall` 会按 `--sql-mode` 自动选用对应块中的 S3 对象（与 `run_vector_test.py ann` 导出文件名 `query_{mode}_k{k}.*` 一致）。
 
 ```bash
 pip install boto3

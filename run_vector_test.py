@@ -524,12 +524,18 @@ def apply_gt_source(paths: dict, gt_source: str) -> dict:
 
 def resolve_recall_dataset_paths(args) -> dict:
     """合并 CLI 与 cfg.dataset 的 query/GT 路径（CLI 优先）。"""
+    from ann_s3 import resolve_ann_file_specs
+
     ds = (getattr(args, "_index_config", None) or {}).get("dataset", {}) or {}
+    ann_s3 = ds.get("ann_s3") or {}
+    ann_by_mode = resolve_ann_file_specs(args, ann_s3, ds) if ann_s3 else {}
 
     def pick(attr: str, key: str):
         v = getattr(args, attr, None)
         if v is not None and v != "":
             return v
+        if ann_by_mode.get(key):
+            return ann_by_mode[key]
         return ds.get(key)
 
     id_offset = getattr(args, "id_offset", None)

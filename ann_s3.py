@@ -15,6 +15,43 @@ ANN_FILE_ATTRS = (
     "query_filters",
 )
 
+SQL_MODE_ANN_BLOCKS = ("l2_only", "l2_filter", "l2_filter_threshold")
+
+
+def resolve_ann_file_specs(args: Any, ann_s3: dict, ds: Optional[dict] = None) -> dict:
+    """按 args.sql_mode 从 ann_s3 的 per-mode 块或顶层扁平字段解析 S3 对象名。
+
+    配置示例::
+
+        "ann_s3": {
+          "prefix": "vector/wiki_ann/ivfflat_10m",
+          "local_dir": "/tmp/wiki_ann_ivfflat_10m",
+          "l2_only": { "query_fvecs": "query_l2_only_k100.fvecs", ... },
+          "l2_filter": { ... },
+          "l2_filter_threshold": { ... }
+        }
+
+    顶层 query_fvecs 等（无 mode 块时）视为 l2_only 兼容旧配置。
+    """
+    ds = ds or {}
+    mode = getattr(args, "sql_mode", None) or "l2_only"
+    specs: dict = {}
+
+    block = ann_s3.get(mode)
+    if isinstance(block, dict):
+        for attr in ANN_FILE_ATTRS:
+            v = block.get(attr)
+            if v:
+                specs[attr] = v
+
+    if not specs and mode == "l2_only":
+        for attr in ANN_FILE_ATTRS:
+            v = ann_s3.get(attr) or ds.get(attr)
+            if v:
+                specs[attr] = v
+
+    return specs
+
 
 def resolve_s3_connection(args: Any, cfg: dict) -> dict:
     """合并 dataset.s3、ann_s3 连接字段、CLI 与凭证文件（不要求 filepath）。"""
@@ -130,9 +167,15 @@ def materialize_ann_files_from_s3(args: Any) -> Optional[str]:
     prefix = ann_s3.get("prefix", "")
     local_dir = _resolve_local_cache_dir(args, cfg, ann_s3)
     refresh = bool(getattr(args, "ann_s3_refresh", False))
+    mode = getattr(args, "sql_mode", None) or "l2_only"
+    file_specs = resolve_ann_file_specs(args, ann_s3, ds)
+    if not file_specs:
+        return (
+            f"ann_s3 未配置 sql_mode={mode!r} 的 ann 文件"
+            f"（请在 ann_s3.{mode} 或顶层 l2_only 字段中设置 query_fvecs 等）"
+        )
 
-    for attr in ANN_FILE_ATTRS:
-        spec = ann_s3.get(attr) or ds.get(attr)
+    for attr, spec in file_specs.items():
         if not spec:
             continue
 
