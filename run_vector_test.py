@@ -621,6 +621,13 @@ def run_ann(args):
 
 def run_eval(args):
     """运行召回率/QPS 评估（调用 eval_vector_search_from_table.py）"""
+    from ann_s3 import materialize_ann_files_from_s3
+
+    ann_err = materialize_ann_files_from_s3(args)
+    if ann_err:
+        print(f"错误: {ann_err}")
+        return 1
+
     cmd = [sys.executable, EVAL_SCRIPT]
 
     # 基本参数
@@ -869,6 +876,11 @@ def main():
             default=None,
             help="GT 来源：auto=有 fbin 则用 fbin 否则 ann；fbin/ann=强制指定一套（两套都配时必用）",
         )
+        p.add_argument(
+            "--ann-s3-refresh",
+            action="store_true",
+            help="强制从 S3 重新下载 dataset.ann_s3 中的 ann 文件",
+        )
 
     def _add_import_args(p):
         p.add_argument("--batch-size", type=int, default=20000, help="fbin INSERT 批量大小")
@@ -986,6 +998,11 @@ def main():
         choices=list(GT_SOURCE_CHOICES),
         default=None,
         help="GT 来源：auto / fbin / ann（见 run_wiki recall --gt-source）",
+    )
+    run_parser.add_argument(
+        "--ann-s3-refresh",
+        action="store_true",
+        help="强制从 S3 重新下载 dataset.ann_s3 中的 ann 文件",
     )
 
     args = parser.parse_args()

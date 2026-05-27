@@ -222,6 +222,27 @@ python run_wiki.py recall --config cfg/ivfflat_10M.json --gt-source ann \\
   --id-mapping id_mapping_l2_only_k100.txt -n 5000 -k 100 --concurrency 32
 ```
 
+**ann 文件在 S3 上（recall 前自动下载）**
+
+在 `dataset.ann_s3` 中配置对象前缀与文件名（复用 `dataset.s3` 的 endpoint/bucket/region 与 `cfg/s3_credentials.json` 密钥）：
+
+```json
+"gt_source": "ann",
+"ann_s3": {
+  "prefix": "vector/wiki_ann/ivfflat_10m",
+  "query_fvecs": "query_l2_only_k100.fvecs",
+  "groundtruth_ivecs": "groundtruth_l2_only_k100.ivecs",
+  "id_mapping": "id_mapping_l2_only_k100.txt",
+  "local_dir": "/tmp/wiki_ann_ivfflat_10m"
+}
+```
+
+```bash
+pip install boto3
+python run_wiki.py recall --config cfg/ivfflat_10M.json --gt-source ann -n 5000 -k 100 --concurrency 32
+# 强制重新拉取 S3：加 --ann-s3-refresh
+```
+
 召回公式变为 **eligible recall@k**：每条 query 的分母取 `min(k, |filtered_gt|)`，避免当 `.ibin` 深度不足导致过滤后邻居少于 k 时召回率无法达到 1.0。`.ibin` 的 `k_file` 越大，过滤后剩余邻居越多；若出现"可用 GT 不足 k"的警告，请使用更深的 groundtruth 文件（期望 `k_file >= k * distinct_file_ids`）。
 
 **常用参数**

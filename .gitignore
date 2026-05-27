@@ -3,5 +3,6 @@ cfg/s3_credentials.json
 
 .venv/
 venv/
+.cache/
 __pycache__/
 *.pyc

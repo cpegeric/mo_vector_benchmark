@@ -28,6 +28,14 @@
     "base_fbin": ["/home/ubuntu/github/vector_benchmark/wiki_all_10M/base.10M.fbin"],
     "query_fbin": "/home/ubuntu/github/vector_benchmark/wiki_all_10M/queries.fbin",
     "groundtruth_ibin": "/home/ubuntu/github/vector_benchmark/wiki_all_10M/groundtruth.10M.neighbors.ibin",
+    "gt_source": "ann",
+    "ann_s3": {
+      "prefix": "vector/wiki_ann/ivfflat_10m",
+      "query_fvecs": "query_l2_only_k100.fvecs",
+      "groundtruth_ivecs": "groundtruth_l2_only_k100.ivecs",
+      "id_mapping": "id_mapping_l2_only_k100.txt",
+      "local_dir": "/tmp/wiki_ann_ivfflat_10m"
+    },
     "id_offset": 1
   }
 }

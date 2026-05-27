@@ -139,6 +139,7 @@ def build_args(cli) -> SimpleNamespace:
     ns.query_filters = getattr(cli, "query_filters", None)
     ns.id_offset = getattr(cli, "id_offset", None)
     ns.gt_source = getattr(cli, "gt_source", None)
+    ns.ann_s3_refresh = getattr(cli, "ann_s3_refresh", False)
     ns.skip_db_verify = True
     attach_dataset_fields(ns, cfg)
 
@@ -292,6 +293,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="GT 来源：auto=有 fbin 用 fbin；fbin/ann=强制一套（两套都配时区分测试）",
     )
+    parser.add_argument(
+        "--ann-s3-refresh",
+        action="store_true",
+        help="强制从 S3 重新下载 dataset.ann_s3 中的 ann 文件（默认使用本地缓存）",
+    )
 
     # 导入相关
     parser.add_argument("--batch-size", type=int, default=20000, help="导入批量大小（INSERT 路径用，默认: 20000）")
@@ -396,6 +402,12 @@ def main() -> int:
         return _run_step("drop-index", _drop_index)
 
     if cmd == "recall":
+        from ann_s3 import materialize_ann_files_from_s3
+
+        ann_err = materialize_ann_files_from_s3(ns)
+        if ann_err:
+            print(f"错误: {ann_err}")
+            return 1
         validate_recall_paths(ns)
         return _run_step("run (recall)", run_eval)
 

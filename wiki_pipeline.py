@@ -13,35 +13,10 @@ from s3_credentials import DEFAULT_S3_CREDENTIALS_FILE, load_s3_credentials
 
 
 def resolve_s3_config(args: Any, cfg: dict) -> dict | None:
-    """合并 cfg.dataset.s3、CLI 与 cfg/s3_credentials.json。"""
-    ds = cfg.get("dataset", {}) or {}
-    s3_cfg = dict(ds.get("s3") or {})
+    """合并 cfg.dataset.s3、CLI 与 cfg/s3_credentials.json（LOAD DATA 导入用，需 filepath）。"""
+    from ann_s3 import resolve_s3_connection
 
-    cli_map = {
-        "endpoint": getattr(args, "s3_endpoint", None),
-        "bucket": getattr(args, "s3_bucket", None),
-        "filepath": getattr(args, "s3_filepath", None),
-        "region": getattr(args, "s3_region", None),
-        "compression": getattr(args, "s3_compression", None),
-        "access_key_id": getattr(args, "s3_access_key_id", None),
-        "secret_access_key": getattr(args, "s3_secret_access_key", None),
-    }
-    for k, v in cli_map.items():
-        if v is not None and v != "":
-            s3_cfg[k] = v
-
-    cred_file = getattr(args, "s3_credentials_file", None) or DEFAULT_S3_CREDENTIALS_FILE
-    file_creds = load_s3_credentials(cred_file)
-
-    if not s3_cfg.get("access_key_id"):
-        s3_cfg["access_key_id"] = (
-            file_creds.get("access_key_id") or os.environ.get("MO_S3_ACCESS_KEY_ID")
-        )
-    if not s3_cfg.get("secret_access_key"):
-        s3_cfg["secret_access_key"] = (
-            file_creds.get("secret_access_key") or os.environ.get("MO_S3_SECRET_ACCESS_KEY")
-        )
-
+    s3_cfg = resolve_s3_connection(args, cfg)
     if not any(s3_cfg.get(k) for k in ("endpoint", "bucket", "filepath")):
         return None
     return s3_cfg
