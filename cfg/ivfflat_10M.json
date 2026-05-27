@@ -19,10 +19,10 @@
   },
   "dataset": {
     "s3": {
-      "endpoint": "http://cos.ap-guangzhou.myqcloud.com",
-      "bucket": "mo-load-guangzhou-1308875761",
+      "endpoint": "",
+      "bucket": "",
       "filepath": "vector/wiki_all_10m/historical_file_blocks_wiki_all_10m.csv",
-      "region": "ap-guangzhou",
+      "region": "",
       "compression": "none"
     },
     "base_fbin": ["/home/ubuntu/github/vector_benchmark/wiki_all_10M/base.10M.fbin"],
@@ -30,24 +30,24 @@
     "groundtruth_ibin": "/home/ubuntu/github/vector_benchmark/wiki_all_10M/groundtruth.10M.neighbors.ibin",
     "gt_source": "ann",
     "ann_s3": {
-      "prefix": "vector/wiki_ann/ivfflat_10m",
+      "prefix": "vector/wiki_all_10m/",
       "local_dir": "/tmp/wiki_ann_ivfflat_10m",
       "l2_only": {
-        "query_fvecs": "query_l2_only_k100.fvecs",
-        "groundtruth_ivecs": "groundtruth_l2_only_k100.ivecs",
-        "id_mapping": "id_mapping_l2_only_k100.txt"
+        "query_fvecs": "query_l2_only_k10.fvecs",
+        "groundtruth_ivecs": "groundtruth_l2_only_k10.ivecs",
+        "id_mapping": "id_mapping_l2_only_k10.txt"
       },
       "l2_filter": {
-        "query_fvecs": "query_l2_filter_k100.fvecs",
-        "groundtruth_ivecs": "groundtruth_l2_filter_k100.ivecs",
-        "id_mapping": "id_mapping_l2_filter_k100.txt",
-        "query_filters": "query_l2_filter_k100.filters.txt"
+        "query_fvecs": "query_l2_filter_k10.fvecs",
+        "groundtruth_ivecs": "groundtruth_l2_filter_k10.ivecs",
+        "id_mapping": "id_mapping_l2_filter_k10.txt",
+        "query_filters": "query_l2_filter_k10.filters.txt"
       },
       "l2_filter_threshold": {
-        "query_fvecs": "query_l2_filter_threshold_k100.fvecs",
-        "groundtruth_ivecs": "groundtruth_l2_filter_threshold_k100.ivecs",
-        "id_mapping": "id_mapping_l2_filter_threshold_k100.txt",
-        "query_filters": "query_l2_filter_threshold_k100.filters.txt"
+        "query_fvecs": "query_l2_filter_threshold_k10.fvecs",
+        "groundtruth_ivecs": "groundtruth_l2_filter_threshold_k10.ivecs",
+        "id_mapping": "id_mapping_l2_filter_threshold_k10.txt",
+        "query_filters": "query_l2_filter_threshold_k10.filters.txt"
       }
     },
     "id_offset": 1
