@@ -13,7 +13,7 @@
   },
   "dimension": 768,
   "env": {
-    "probe_limit": 20,
+    "probe_limit": 5,
     "kmeans_train_percent": 2,
     "ivf_preload_entries": 0
   },
