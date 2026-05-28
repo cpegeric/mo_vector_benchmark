@@ -56,6 +56,41 @@ def attach_dataset_fields(args: Any, cfg: dict) -> None:
         args.skip_db_verify = True
 
 
+def recall_allows_missing_filter_val(args: Any) -> bool:
+    """S2/S3 召回是否可不传 --filter-val。
+
+    - l2_only：不需要 filter。
+    - --distribute-file-ids：eval 从表取 DISTINCT file_id，queries 均分到各分区。
+    - ann + cfg/S3 含 query_filters（或 CLI --query-filters）：每条 query 自带 file_id。
+    - 其它：eval 会从库中随机抽一个 file_id（仅当 ann 全表同一分区时合理）。
+    """
+    sql_mode = getattr(args, "sql_mode", None) or "l2_only"
+    if sql_mode not in ("l2_filter", "l2_filter_threshold"):
+        return True
+
+    if getattr(args, "distribute_file_ids", False):
+        return True
+
+    from run_vector_test import resolve_gt_source
+
+    if resolve_gt_source(args) != "ann":
+        return False
+
+    if getattr(args, "query_filters", None):
+        return True
+
+    cfg = getattr(args, "_index_config", None) or {}
+    ds = cfg.get("dataset", {}) or {}
+    ann_s3 = ds.get("ann_s3") or {}
+    if not ann_s3:
+        return False
+
+    from ann_s3 import resolve_ann_file_specs
+
+    specs = resolve_ann_file_specs(args, ann_s3, ds)
+    return bool(specs.get("query_filters"))
+
+
 def validate_import_paths(args: Any) -> int:
     if getattr(args, "s3", None):
         required = (
