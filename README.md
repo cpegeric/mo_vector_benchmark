@@ -127,7 +127,8 @@ python run_wiki.py <command> --config cfg/xxx.json [options]
 | `create_index` | 仅创建向量索引（读取 `cfg.index` 与 `cfg.env`） |
 | `drop_index` | 删除索引（索引名取自 `cfg.index.name`，同时尝试清理旧名 `idx_embedding`） |
 | `gen_csv` | 将 `dataset.base_fbin` 转为 6 列 CSV（LOAD DATA 兼容），不连库 |
-| `recall` | 仅跑召回评估（自动把 `cfg.env.probe_limit` 设置到查询 session） |
+| `ann` | 在线生成 ann 评测文件（`query/groundtruth/id_mapping`，S2/S3 还可生成 `.filters.txt`）；内部调用 `eval_vector_search_from_table.py` |
+| `recall` | 仅跑召回评估（子进程调用 `eval_vector_search_from_table.py`；自动透传 `cfg` 连库参数、`cfg.env`、ann 路径） |
 
 `dataset.base_fbin` 可为单个字符串或字符串数组，用于多 shard 数据集：
 
@@ -188,13 +189,21 @@ python run_wiki.py recall --config cfg/ivfpq_1M.json \
 
 **过滤召回（l2_filter / l2_filter_threshold）**
 
-`--sql-mode l2_filter` / `l2_filter_threshold` 时必须提供 `--filter-val=<file_id>`，SQL 会按 `WHERE file_id = ?` 过滤，GT 也会本地按相同谓词筛选：
+S2/S3 的 SQL 带 `WHERE file_id = ?`。`file_id` 来源（三选一，按优先级）：
+
+| 方式 | 说明 |
+|------|------|
+| **`--filter-val=<file_id>`** | 所有 query 共用同一个 `file_id` |
+| **ann + `query_filters`（`.filters.txt`）** | 每条 query 一行 `file_id`；`cfg.ann_s3.l2_filter` 等已配置时 **无需** `--filter-val`（推荐多租户 recall） |
+| **`--distribute-file-ids`** | 从表取至多 N 个 `DISTINCT file_id`，将 `num_queries` 均分到各分区（在线抽样或 `ann` 生成时写出 `.filters.txt`） |
+
+导入数据的 `file_id` 分布（与 `gen.py` / `gen_csv` 一致）：
 
 ```
 file_id = file_id_base + (row_idx - 1) % distinct_file_ids
 ```
 
-`gen_csv` / `import` 默认 `file_id_base=20000000`、`distinct_file_ids=50`；若自定义过生成参数，需用 `--filter-file-id-base` / `--filter-distinct-file-ids` 告诉召回脚本同样的值，否则 GT 过滤不一致。
+默认 `file_id_base=20000000`、`distinct_file_ids=50`。用 cuVS `.ibin` 做本地 GT 过滤时，需用 `--filter-file-id-base` / `--filter-distinct-file-ids` 与生成时一致；ann 三件套 + `.filters.txt` 则 GT 已按分区导出，无需再筛。
 
 **召回 GT 来源（`recall` / `run` / `all` 最后一步）**
 
@@ -215,12 +224,18 @@ file_id = file_id_base + (row_idx - 1) % distinct_file_ids
 # cuVS 预计算 GT
 python run_wiki.py recall --config cfg/ivfflat_10M.json --gt-source fbin -n 5000 -k 100 --concurrency 32
 
-# ann-benchmarks 预生成 GT（run_vector_test.py ann 产出）
+# ann 预生成 GT（路径也可写在 cfg.dataset.ann_s3，见下）
 python run_wiki.py recall --config cfg/ivfflat_10M.json --gt-source ann \\
-  --query-fvecs query_l2_only_k100.fvecs \\
-  --groundtruth-ivecs groundtruth_l2_only_k100.ivecs \\
-  --id-mapping id_mapping_l2_only_k100.txt -n 5000 -k 100 --concurrency 32
+  --sql-mode l2_only -n 5000 -k 100 --concurrency 32
+
+# S2 多 file_id recall（S3 上 ann 含 query_filters 时无需 --filter-val）
+python run_wiki.py recall --config cfg/ivfflat_10M.json --gt-source ann \\
+  --sql-mode l2_filter -n 10000 -k 10 --concurrency 100
 ```
+
+**`recall` 与 `eval_vector_search_from_table.py`**
+
+`run_wiki.py recall` / `run_vector_test.py run` 均通过 `run_eval()` 启动子进程执行 `eval_vector_search_from_table.py` 的 `evaluate()`，召回公式与 QPS 统计逻辑相同。`cfg/*.json` 中的 `host` / `port` / `user` / `password` / `database` / `table` 会传给 eval；日志中的表名与 `cfg.table` 一致。
 
 **ann 文件在 S3 上（recall 前自动下载）**
 
@@ -251,13 +266,31 @@ python run_wiki.py recall --config cfg/ivfflat_10M.json --gt-source ann \\
 }
 ```
 
-`recall` 会按 `--sql-mode` 自动选用对应块中的 S3 对象（与 `run_vector_test.py ann` 导出文件名 `query_{mode}_k{k}.*` 一致）。
+`recall` 会按 `--sql-mode` 自动选用 `ann_s3.<mode>` 中的 S3 对象（文件名与 `ann` 导出一致：`query_{mode}_k{k}.*`）。评测时 `id_mapping` 每行为 `file_id` 与表主键 `id`（制表符分隔），与 SQL 返回一致。
+
+**生成多 file_id 的 ann（再上传 S3 或本地 recall）**
 
 ```bash
 pip install boto3
-python run_wiki.py recall --config cfg/ivfflat_10M.json --gt-source ann -n 5000 -k 100 --concurrency 32
+
+# 1) 在线生成：均分到表内 DISTINCT file_id，并写出 query_<mode>_k<k>.filters.txt
+python run_wiki.py ann --config cfg/ivfflat_10M.json \\
+  --sql-mode l2_filter --distribute-file-ids -n 10000 -k 10
+# 产出示例：query_l2_filter_k10.fvecs、groundtruth_l2_filter_k10.ivecs、
+#           id_mapping_l2_filter_k10.txt、query_l2_filter_k10.filters.txt
+
+# 2) 用 cfg ann_s3 下载后 recall（多 file_id 无需 --filter-val）
+python run_wiki.py recall --config cfg/ivfflat_10M.json --gt-source ann \\
+  --sql-mode l2_filter -n 10000 -k 10 --concurrency 100
+
+# 3) 不预生成 ann，在线多 file_id recall（较慢）
+python run_wiki.py recall --config cfg/ivfflat_10M.json \\
+  --sql-mode l2_filter --distribute-file-ids -n 10000 -k 10 --concurrency 100
+
 # 强制重新拉取 S3：加 --ann-s3-refresh
 ```
+
+等价命令：`python run_vector_test.py ann|run ...`（需 `--config` 时行为与上相同）。
 
 召回公式变为 **eligible recall@k**：每条 query 的分母取 `min(k, |filtered_gt|)`，避免当 `.ibin` 深度不足导致过滤后邻居少于 k 时召回率无法达到 1.0。`.ibin` 的 `k_file` 越大，过滤后剩余邻居越多；若出现"可用 GT 不足 k"的警告，请使用更深的 groundtruth 文件（期望 `k_file >= k * distinct_file_ids`）。
 
@@ -274,11 +307,16 @@ python run_wiki.py recall --config cfg/ivfflat_10M.json --gt-source ann -n 5000 
 | `--input-csv-prefix PREFIX` | `all` / `import` | 匹配 `{PREFIX}*.csv`，按顺序逐个 LOAD DATA |
 | `-o, --output PATH` | `gen_csv` | 输出单个 CSV 路径 |
 | `--output-csv-prefix PREFIX` | `gen_csv` | 按前缀输出多个 CSV（每个 .fbin 对应 `{PREFIX}0.csv` ...） |
-| `-n` / `-k` / `--concurrency` / `--sql-mode` | `all` / `recall` | 召回评估参数 |
-| `--filter-val` | `all` / `recall` | file_id 过滤值；`--sql-mode l2_filter` / `l2_filter_threshold` 必填 |
+| `-n` / `-k` / `--concurrency` / `--sql-mode` | `all` / `recall` / `ann` | 召回/生成 ann 参数 |
+| `--gt-source` | `recall` / `all` | `auto` / `fbin` / `ann`，指定 GT 来源 |
+| `--ann-s3-refresh` | `recall` | 强制从 S3 重新下载 `ann_s3` 文件 |
+| `--filter-val` | `all` / `recall` / `ann` | 单一 `file_id`；S2/S3 若已有 `query_filters` 或 `--distribute-file-ids` 可省略 |
+| `--distribute-file-ids` | `recall` / `ann` | 多 `file_id`：均分 queries；`ann` 会写出 `.filters.txt` |
+| `--max-distinct-file-ids` | `recall` / `ann` | 配合 `--distribute-file-ids`；默认 50，`0`=不限制 |
 | `--filter-mode` | `all` / `recall` | `pre` / `post` / `force` / `include`，SQL 执行层过滤方式（对应 `BY RANK WITH OPTION 'mode=...'`） |
-| `--filter-file-id-base` | `all` / `recall` | 本地 GT 过滤用 file_id_base，需与生成时一致（默认 20000000） |
-| `--filter-distinct-file-ids` | `all` / `recall` | 本地 GT 过滤用 distinct_file_ids，需与生成时一致（默认 50） |
+| `--filter-file-id-base` | `all` / `recall` | 本地 `.ibin` GT 过滤用 file_id_base（默认 20000000） |
+| `--filter-distinct-file-ids` | `all` / `recall` | 本地 `.ibin` GT 过滤用 distinct_file_ids（默认 50） |
+| `host` / `port` / `user` / `password` / `database` / `table` | `cfg/*.json` | 连库与评测表名；`recall` 会传给 `eval_vector_search_from_table.py` |
 | `--expected-dim` | `gen_csv` | 期望向量维度（默认 768） |
 | `--batch-size` | `all` / `import` | INSERT 批量大小（默认 20000） |
 | `--file-id-base` / `--distinct-file-ids` | `all` / `import` / `gen_csv` | file_id 生成规则 |
@@ -313,31 +351,34 @@ CREATE TABLE `historical_file_blocks_wiki` (
 ```
 ### 全局参数
 
+`run_vector_test.py` 与各子命令的全局连库参数；**使用 `run_wiki.py` + `--config` 时以 JSON 为准**（会写入 eval 子进程）。
+
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--host` | 127.0.0.1 | 数据库主机 |
+| `--host` | 127.0.0.1 | 数据库主机（`cfg/*.json` 同字段） |
 | `--port` | 6001 | 端口 |
 | `--user` | dump | 用户名 |
 | `--password` | 111 | 密码 |
 | `--database` | jst_app_wiki | 数据库名 |
-| `--table` | historical_file_blocks_wiki | 表名 |
+| `--table` | historical_file_blocks_wiki | 表名（eval SQL 与日志均使用此名） |
 
 ### 4. 生成 ANN 评测文件
 
-生成 `query.fvecs` 和 `groundtruth.ivecs` 文件，用于后续评估。
+生成 `query.fvecs`、`groundtruth.ivecs`、`id_mapping.txt`；S2/S3 加 `--distribute-file-ids` 时额外生成 `query_<mode>_k<k>.filters.txt`（每行一个 query 的 `file_id`），供后续多分区 recall。
 
 ```bash
-# 生成全表搜索模式的 ANN 文件
-python run_vector_test.py ann --sql-mode l2_only -n 1000 -k 10 --distribute-file-ids
+# 推荐：与 cfg 一致（连库、表名、索引 env 均来自 JSON）
+python run_wiki.py ann --config cfg/ivfflat_10M.json --sql-mode l2_only -n 1000 -k 10
 
-# 生成预过滤模式的 ANN 文件
-python run_vector_test.py ann \
-  --sql-mode l2_filter \
-  --distribute-file-ids \
-  -n 1000 -k 10
+python run_wiki.py ann --config cfg/ivfflat_10M.json \\
+  --sql-mode l2_filter --distribute-file-ids -n 10000 -k 10
 
-# 生成距离阈值过滤模式的 ANN 文件
-python run_vector_test.py ann --sql-mode l2_filter_threshold --distribute-file-ids -n 1000 -k 10
+python run_wiki.py ann --config cfg/ivfflat_10M.json \\
+  --sql-mode l2_filter_threshold --distribute-file-ids -n 10000 -k 10
+
+# 等价：run_vector_test.py（需自行传连库参数或 --config）
+python run_vector_test.py ann --config cfg/ivfflat_10M.json \\
+  --sql-mode l2_filter --distribute-file-ids -n 1000 -k 10
 ```
 
 **参数说明**
@@ -348,26 +389,34 @@ python run_vector_test.py ann --sql-mode l2_filter_threshold --distribute-file-i
 | `-n, --num-queries` | 1000 | 查询数量 |
 | `-k` | 10 | Top-K |
 | `--concurrency` | 1 | 并发数 |
-| `--filter-val` | - | file_id 过滤值（用于 l2_filter 模式） |
-| `--distribute-file-ids` | - | 将查询分布到多个不同的 file_id |
-| `--max-distinct-file-ids` | 50 | 最多使用多少个不同的 file_id |
+| `--filter-val` | - | 单一 `file_id`；多分区生成请用 `--distribute-file-ids` |
+| `--distribute-file-ids` | - | 将 query 均分到多个 `DISTINCT file_id`，并写出 `.filters.txt` |
+| `--max-distinct-file-ids` | 50 | 最多使用多少个不同的 `file_id`（`0`=不限制） |
 
-**注意**：生成ann文件是暴力搜索生成的预期结果，-n 1000值越大生成文件越慢，可以调节变小缩短生成时间，适用于快速验证测试  
+**注意**：`ann` 用精确 GT SQL（`BY RANK WITH OPTION 'mode=force'`）导出，`-n` 越大越慢，可先用小 `-n` 验证。生成后可将文件上传到 `cfg.dataset.ann_s3.prefix` 对应路径。
 
 
 ### 5. 运行召回率/QPS 评估
 
-运行向量搜索性能评估，输出召回率和 QPS。支持三种 SQL 场景和多种 Filter 模式，可全面评估向量索引在不同配置下的性能表现。
+运行向量搜索性能评估，输出召回率和 QPS。支持三种 SQL 场景和多种 Filter 模式。
 
 ```bash
-# 全表搜索评估（l2_only 场景）
-python run_vector_test.py run --sql-mode l2_only -n 1000 -k 10 --concurrency 100
+# 推荐：run_wiki + cfg（连库、表、probe_limit、ann_s3 均来自 JSON）
+python run_wiki.py recall --config cfg/ivfflat_10M.json --gt-source ann \\
+  --sql-mode l2_only -n 10000 -k 10 --concurrency 100
 
-# 预过滤模式评估（l2_filter 场景）
-python run_vector_test.py run \
-  --sql-mode l2_filter \
-  --filter-val 20000000 \
-  -n 1000 -k 10 --concurrency 100
+# 全表搜索（run_vector_test，需 --config 或手动传连库参数）
+python run_vector_test.py run --config cfg/ivfflat_10M.json \\
+  --sql-mode l2_only -n 1000 -k 10 --concurrency 100 --skip-db-verify
+
+# 预过滤：单一 file_id
+python run_vector_test.py run --config cfg/ivfflat_10M.json \\
+  --sql-mode l2_filter --filter-val 20000000 \\
+  -n 1000 -k 10 --concurrency 100 --skip-db-verify
+
+# 预过滤：多 file_id（无预生成 ann 时）
+python run_wiki.py recall --config cfg/ivfflat_10M.json \\
+  --sql-mode l2_filter --distribute-file-ids -n 1000 -k 10 --concurrency 100
 
 # 调整 IVF 索引 probe 参数测试召回率
 python run_vector_test.py run \
@@ -397,8 +446,9 @@ python run_vector_test.py run \
 | `-n, --num-queries` | 1000 | 查询数量 |
 | `-k` | 10 | Top-K |
 | `--concurrency` | 1 | 并发数 |
-| `--filter-val` | - | file_id 过滤值（用于 l2_filter 场景） |
-| `--probe` | - | IVF 索引 probe 参数，控制查询时扫描的聚类数 |
-| `--distribute-file-ids` | - | 将查询分布到多个不同的 file_id |
-| `--max-distinct-file-ids` | 50 | 最多使用多少个不同的 file_id |
-| `--skip-db-verify` | - | 跳过数据库预检 |
+| `--gt-source` | auto | `fbin` / `ann` / `auto` |
+| `--filter-val` | - | 单一 `file_id`；ann 含 `.filters.txt` 时可省略 |
+| `--probe` | cfg.env | `run_wiki` 默认用 `cfg.env.probe_limit`；`run_vector_test` 可传 `--probe` |
+| `--distribute-file-ids` | - | 在线多 `file_id` recall（有预生成 ann 时一般不需要） |
+| `--max-distinct-file-ids` | 50 | 配合 `--distribute-file-ids` |
+| `--skip-db-verify` | - | 跳过数据库预检（`run_wiki recall` 默认已跳过） |

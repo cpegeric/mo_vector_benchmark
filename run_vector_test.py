@@ -1033,11 +1033,19 @@ def main():
         args._index_config = cfg
 
     if args.command == "all":
+        from wiki_pipeline import attach_dataset_fields, recall_allows_missing_filter_val
+
         needs_filter = args.sql_mode in ("l2_filter", "l2_filter_threshold")
-        if needs_filter and args.filter_val is None:
-            print(f"错误: --sql-mode {args.sql_mode} 需要 --filter-val=<file_id>")
+        if (
+            needs_filter
+            and args.filter_val is None
+            and not recall_allows_missing_filter_val(args)
+        ):
+            print(
+                f"错误: --sql-mode {args.sql_mode} 需要 --filter-val=<file_id>，"
+                f"或在 ann_s3.{args.sql_mode} 中配置 query_filters。"
+            )
             return 2
-        from wiki_pipeline import attach_dataset_fields
 
         attach_dataset_fields(args, cfg)
         return run_all(args)

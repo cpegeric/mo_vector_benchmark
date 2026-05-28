@@ -14,6 +14,7 @@ run_wiki.py — Wiki-all 基准测试子命令入口
   create_index  仅创建向量索引
   drop_index    删除向量索引（index.name 取自 JSON；兼容旧名 idx_embedding）
   gen_csv       从 dataset.base_fbin 生成 LOAD DATA 兼容的 6 列 CSV（不连库）
+  ann           在线生成 ann 评测文件（query/groundtruth/id_mapping[/.filters.txt]）
   recall        仅跑召回评估（支持 cuVS fbin/ibin 或 ann fvecs/ivecs/id_mapping）
 
 JSON 配置（cfg/*.json）示例：
@@ -53,6 +54,14 @@ JSON 配置（cfg/*.json）示例：
       --groundtruth-ivecs groundtruth_l2_only_k10.ivecs \\
       --id-mapping id_mapping_l2_only_k10.txt -n 1000 -k 10
 
+  # 生成多 file_id 的 ann（S2/S3，均分到表中 DISTINCT file_id，并写出 .filters.txt）
+  python run_wiki.py ann --config cfg/ivfflat_10M.json \\
+      --sql-mode l2_filter --distribute-file-ids -n 10000 -k 10
+
+  # 用 S3 上已有多分区 ann（cfg ann_s3.*.query_filters）做 recall，无需 --filter-val
+  python run_wiki.py recall --config cfg/ivfflat_10M.json --gt-source ann \\
+      --sql-mode l2_filter -n 10000 -k 10 --concurrency 100
+
   python run_wiki.py drop_index --config cfg/ivfpq_1M.json
 """
 
@@ -70,6 +79,7 @@ from run_vector_test import (  # noqa: E402
     _ARG_DEFAULTS,
     apply_config_to_args,
     load_index_config,
+    run_ann,
     run_eval,
     run_wiki_create_index,
     run_wiki_create_table,
@@ -78,6 +88,7 @@ from gen import convert_fbin_to_csv  # noqa: E402
 from s3_credentials import DEFAULT_S3_CREDENTIALS_FILE  # noqa: E402
 from wiki_pipeline import (  # noqa: E402
     attach_dataset_fields,
+    recall_allows_missing_filter_val,
     run_all_pipeline,
     run_import_step,
     run_setup_pipeline,
@@ -94,6 +105,7 @@ COMMANDS = (
     "create_index",
     "drop_index",
     "gen_csv",
+    "ann",
     "recall",
 )
 
@@ -126,8 +138,8 @@ def build_args(cli) -> SimpleNamespace:
     ns.concurrency = cli.concurrency
     ns.filter_val = cli.filter_val
     ns.duration = None
-    ns.distribute_file_ids = False
-    ns.max_distinct_file_ids = 50
+    ns.distribute_file_ids = getattr(cli, "distribute_file_ids", False)
+    ns.max_distinct_file_ids = getattr(cli, "max_distinct_file_ids", 50)
     ns.filter_mode = cli.filter_mode
     ns.filter_file_id_base = cli.filter_file_id_base
     ns.filter_distinct_file_ids = cli.filter_distinct_file_ids
@@ -234,14 +246,26 @@ def _build_parser() -> argparse.ArgumentParser:
         "--sql-mode",
         choices=["l2_only", "l2_filter", "l2_filter_threshold"],
         default="l2_only",
-        help="SQL 模式（默认: l2_only；l2_filter/l2_filter_threshold 需配合 --filter-val）",
+        help="SQL 模式（默认: l2_only；S2/S3 可用 --filter-val 或 --distribute-file-ids / ann .filters.txt）",
+    )
+    parser.add_argument(
+        "--distribute-file-ids",
+        action="store_true",
+        help="S2/S3：将 num_queries 均分到表内多个 DISTINCT file_id（ann 生成或在线 recall）；"
+        "生成 ann 时会写出 query_*.filters.txt",
+    )
+    parser.add_argument(
+        "--max-distinct-file-ids",
+        type=int,
+        default=50,
+        help="配合 --distribute-file-ids：最多使用多少个 DISTINCT file_id（0=不限制）",
     )
     parser.add_argument(
         "--filter-val",
         type=int,
         default=None,
-        help="file_id 过滤值；l2_filter / l2_filter_threshold 必填。"
-        " SQL 中以 WHERE file_id=? 生效，本地 GT 也据此筛可用邻居（eligible recall@k）。",
+        help="file_id 过滤值（S2/S3）。未指定时：--gt-source ann 且 cfg 含 query_filters 则从 .filters.txt 逐条读取；"
+        "否则 eval 从库中随机抽一个 file_id（仅适合 ann 为单一分区导出时）。",
     )
     parser.add_argument(
         "--filter-mode",
@@ -358,14 +382,20 @@ def _build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     cli = _build_parser().parse_args()
 
+    ns = build_args(cli)
+
     needs_filter = cli.sql_mode in ("l2_filter", "l2_filter_threshold")
-    if cli.command in ("all", "recall") and needs_filter and cli.filter_val is None:
+    if (
+        cli.command in ("all", "recall", "ann")
+        and needs_filter
+        and cli.filter_val is None
+        and not recall_allows_missing_filter_val(ns)
+    ):
         print(
-            f"错误: --sql-mode {cli.sql_mode} 需要 --filter-val=<file_id>（整数）。"
+            f"错误: --sql-mode {cli.sql_mode} 需要 --filter-val=<file_id>（整数），"
+            f"或在 ann_s3.{cli.sql_mode} / CLI 中提供 query_filters（.filters.txt）。"
         )
         return 2
-
-    ns = build_args(cli)
     cmd = cli.command
 
     timings: dict[str, float] = {}
@@ -400,6 +430,9 @@ def main() -> int:
 
     if cmd == "drop_index":
         return _run_step("drop-index", _drop_index)
+
+    if cmd == "ann":
+        return _run_step("ann (export)", run_ann)
 
     if cmd == "recall":
         from ann_s3 import materialize_ann_files_from_s3
