@@ -45,8 +45,9 @@ JSON 配置（cfg/*.json）示例：
   python run_wiki.py all --config cfg/ivfpq_1M.json --csv /tmp/wiki_1M.csv \
       -n 5000 -k 100 --concurrency 32
 
-  # 只跑召回（cuVS fbin/ibin，cfg.dataset 或 CLI）
-  python run_wiki.py recall --config cfg/ivfflat_10M.json -n 5000 -k 100 --concurrency 32
+  # 只跑召回（cuVS fbin/ibin，cfg.dataset 或 cfg.dataset.fbin_s3）
+  python run_wiki.py recall --config cfg/ivfflat_10M.json \\
+      --gt-source fbin -n 5000 -k 100 --concurrency 32
 
   # 只跑召回（ann-benchmarks 预生成文件，与 run_vector_test.py run 一致）
   python run_wiki.py recall --config cfg/ivfflat_10M.json \\
@@ -152,6 +153,7 @@ def build_args(cli) -> SimpleNamespace:
     ns.id_offset = getattr(cli, "id_offset", None)
     ns.gt_source = getattr(cli, "gt_source", None)
     ns.ann_s3_refresh = getattr(cli, "ann_s3_refresh", False)
+    ns.fbin_s3_refresh = getattr(cli, "fbin_s3_refresh", False)
     ns.skip_db_verify = True
     attach_dataset_fields(ns, cfg)
 
@@ -322,6 +324,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="强制从 S3 重新下载 dataset.ann_s3 中的 ann 文件（默认使用本地缓存）",
     )
+    parser.add_argument(
+        "--fbin-s3-refresh",
+        action="store_true",
+        help="强制从 S3 重新下载 dataset.fbin_s3 中的 fbin/ibin（默认使用本地缓存）",
+    )
 
     # 导入相关
     parser.add_argument("--batch-size", type=int, default=20000, help="导入批量大小（INSERT 路径用，默认: 20000）")
@@ -435,11 +442,11 @@ def main() -> int:
         return _run_step("ann (export)", run_ann)
 
     if cmd == "recall":
-        from ann_s3 import materialize_ann_files_from_s3
+        from ann_s3 import materialize_recall_files_from_s3
 
-        ann_err = materialize_ann_files_from_s3(ns)
-        if ann_err:
-            print(f"错误: {ann_err}")
+        s3_err = materialize_recall_files_from_s3(ns)
+        if s3_err:
+            print(f"错误: {s3_err}")
             return 1
         validate_recall_paths(ns)
         return _run_step("run (recall)", run_eval)

@@ -226,7 +226,18 @@ python run_wiki.py recall --config cfg/ivfflat_10M.json \
 
 **适用**：已有 cuVS 的 `queries.fbin` 与 `groundtruth.*.ibin`。
 
-在 cfg 中配置 `dataset.query_fbin`、`dataset.groundtruth_ibin`、`dataset.id_offset`，然后：
+**本地路径**：在 cfg 中配置 `dataset.query_fbin`、`dataset.groundtruth_ibin`、`dataset.id_offset`（本地文件存在时优先使用）。
+
+**S3（CI / 无本地文件时）**：可同时配置 `dataset.fbin_s3`（复用 `dataset.s3` 的 bucket/endpoint 与 `cfg/s3_credentials.json`）；本地路径不存在时自动从 S3 下载到 `local_dir`：
+
+```json
+"fbin_s3": {
+  "prefix": "vector/wiki_all_10m",
+  "local_dir": "/tmp/wiki_fbin_10m",
+  "query_fbin": "queries.fbin",
+  "groundtruth_ibin": "groundtruth.10M.neighbors.ibin"
+}
+```
 
 ```bash
 python run_wiki.py recall --config cfg/ivfflat_10M.json \
@@ -234,6 +245,8 @@ python run_wiki.py recall --config cfg/ivfflat_10M.json \
   --sql-mode l2_only \
   -n 5000 -k 100 --concurrency 32
 ```
+
+更新 S3 文件后加 `--fbin-s3-refresh`（或 `--ann-s3-refresh` 也会刷新 fbin 缓存）。
 
 S2/S3 若用 ibin 本地过滤 GT，需配合 `--filter-val` 与 `--filter-file-id-base` / `--filter-distinct-file-ids`（与灌数时 `file_id` 规则一致）。
 
