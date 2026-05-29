@@ -365,3 +365,66 @@ def materialize_recall_files_from_s3(args: Any) -> Optional[str]:
     if err:
         return err
     return materialize_ann_files_from_s3(args)
+
+
+def apply_recall_dataset_paths(args: Any, paths: dict) -> None:
+    """将合并后的 GT 路径写入 args（CLI 已指定的不覆盖）。"""
+    for arg_name in (
+        "query_fvecs",
+        "groundtruth_ivecs",
+        "id_mapping",
+        "query_filters",
+        "query_fbin",
+        "groundtruth_ibin",
+    ):
+        if getattr(args, arg_name, None) not in (None, ""):
+            continue
+        v = paths.get(arg_name)
+        if v:
+            setattr(args, arg_name, v)
+
+
+def prepare_recall_dataset_from_config(args: Any) -> Optional[str]:
+    """从 --config 加载 cfg，按 gt_source 从 S3 物化 ann/fbin 并填充 args 路径。
+
+    无 --config 或 cfg 中无 ann_s3/fbin_s3 时跳过；成功返回 None，失败返回错误信息。
+    """
+    cfg = getattr(args, "_index_config", None)
+    config_path = getattr(args, "config", None)
+    if cfg is None:
+        if not config_path:
+            return None
+        if not os.path.isfile(config_path):
+            return f"配置文件不存在: {config_path}"
+        import json
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        args._index_config = cfg
+
+    ds = cfg.get("dataset", {}) or {}
+    if not ds.get("ann_s3") and not ds.get("fbin_s3"):
+        return None
+
+    args.sql_mode = getattr(args, "mode", None) or getattr(args, "sql_mode", None) or "l2_only"
+
+    err = materialize_recall_files_from_s3(args)
+    if err:
+        return err
+
+    from run_vector_test import resolve_recall_dataset_paths
+
+    try:
+        paths = resolve_recall_dataset_paths(args)
+    except ValueError as e:
+        return str(e)
+
+    apply_recall_dataset_paths(args, paths)
+
+    gt = resolve_gt_source_from_args(args)
+    effective = paths.get("_gt_source_effective", "db")
+    if effective == "fbin":
+        print(f"[eval] GT 来源: cuVS fbin/ibin (--gt-source={gt})")
+    elif effective == "ann":
+        print(f"[eval] GT 来源: ann fvecs/ivecs/id_mapping (--gt-source={gt})")
+    return None

@@ -2285,11 +2285,76 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="只测试 QPS，不计算 recall（不执行 ground truth SQL，速度更快）",
     )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="索引 JSON（cfg/*.json）；配合 dataset.ann_s3 / fbin_s3 从 S3 下载评测文件",
+    )
+    parser.add_argument(
+        "--gt-source",
+        choices=["auto", "fbin", "ann"],
+        default=None,
+        help="GT 来源：auto=有 fbin 用 fbin；fbin/ann=强制一套（与 run_wiki recall 一致）",
+    )
+    parser.add_argument(
+        "--ann-s3-refresh",
+        action="store_true",
+        help="强制从 S3 重新下载 dataset.ann_s3 中的 ann 文件",
+    )
+    parser.add_argument(
+        "--fbin-s3-refresh",
+        action="store_true",
+        help="强制从 S3 重新下载 dataset.fbin_s3 中的 fbin/ibin",
+    )
+    parser.add_argument(
+        "--s3-credentials-file",
+        type=str,
+        default=None,
+        help="S3 密钥 JSON（默认 cfg/s3_credentials.json）",
+    )
+    parser.add_argument("--s3-endpoint", default=None, help="S3/OSS endpoint（覆盖 cfg.dataset.s3）")
+    parser.add_argument("--s3-bucket", default=None, help="S3 bucket")
+    parser.add_argument("--s3-region", default=None, help="S3 region")
+    parser.add_argument("--s3-access-key-id", default=None, help="覆盖凭证文件中的 AK")
+    parser.add_argument("--s3-secret-access-key", default=None, help="覆盖凭证文件中的 SK")
     return parser.parse_args()
+
+
+def bootstrap_eval_config(args: argparse.Namespace) -> Optional[str]:
+    """加载 --config，应用连库/表/env 默认值，并从 S3 物化 ann/fbin 评测文件。"""
+    if not args.config:
+        return None
+    if not os.path.isfile(args.config):
+        return f"配置文件不存在: {args.config}"
+    with open(args.config, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    args._index_config = cfg
+
+    for key in ("host", "port", "user", "password", "database"):
+        if getattr(args, key, None) is None and cfg.get(key) is not None:
+            setattr(args, key, cfg[key])
+    if args.table is None and cfg.get("table"):
+        args.table = cfg["table"]
+
+    env = cfg.get("env") or {}
+    if env and not args.session_env_json:
+        args.session_env_json = json.dumps(env)
+    if args.probe is None and env.get("probe_limit") is not None:
+        args.probe = int(env["probe_limit"])
+
+    from ann_s3 import prepare_recall_dataset_from_config
+
+    return prepare_recall_dataset_from_config(args)
 
 
 if __name__ == "__main__":
     args = parse_args()
+    cfg_err = bootstrap_eval_config(args)
+    if cfg_err:
+        print(f"错误: {cfg_err}")
+        raise SystemExit(1)
     apply_db_connection(
         host=args.host,
         port=args.port,
