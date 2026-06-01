@@ -1869,6 +1869,7 @@ def evaluate(
                         k,
                         mode_int,
                         q_filters[i],
+                        filter_mode,
                     ): i
                     for i in range(len(query_vecs))
                 }
