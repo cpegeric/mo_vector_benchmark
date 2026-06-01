@@ -524,16 +524,20 @@ def apply_gt_source(paths: dict, gt_source: str) -> dict:
 
 def resolve_recall_dataset_paths(args) -> dict:
     """合并 CLI 与 cfg.dataset 的 query/GT 路径（CLI 优先）。"""
-    from ann_s3 import resolve_ann_file_specs
+    from ann_s3 import resolve_ann_file_specs, resolve_fbin_file_specs
 
     ds = (getattr(args, "_index_config", None) or {}).get("dataset", {}) or {}
     ann_s3 = ds.get("ann_s3") or {}
+    fbin_s3 = ds.get("fbin_s3") or {}
     ann_by_mode = resolve_ann_file_specs(args, ann_s3, ds) if ann_s3 else {}
+    fbin_specs = resolve_fbin_file_specs(fbin_s3, ds) if fbin_s3 else {}
 
     def pick(attr: str, key: str):
         v = getattr(args, attr, None)
         if v is not None and v != "":
             return v
+        if fbin_specs.get(key):
+            return fbin_specs[key]
         if ann_by_mode.get(key):
             return ann_by_mode[key]
         return ds.get(key)
@@ -639,11 +643,11 @@ def run_ann(args):
 
 def run_eval(args):
     """运行召回率/QPS 评估（调用 eval_vector_search_from_table.py）"""
-    from ann_s3 import materialize_ann_files_from_s3
+    from ann_s3 import materialize_recall_files_from_s3
 
-    ann_err = materialize_ann_files_from_s3(args)
-    if ann_err:
-        print(f"错误: {ann_err}")
+    s3_err = materialize_recall_files_from_s3(args)
+    if s3_err:
+        print(f"错误: {s3_err}")
         return 1
 
     cmd = [sys.executable, EVAL_SCRIPT]
@@ -897,6 +901,11 @@ def main():
             action="store_true",
             help="强制从 S3 重新下载 dataset.ann_s3 中的 ann 文件",
         )
+        p.add_argument(
+            "--fbin-s3-refresh",
+            action="store_true",
+            help="强制从 S3 重新下载 dataset.fbin_s3 中的 fbin/ibin",
+        )
 
     def _add_import_args(p):
         p.add_argument("--batch-size", type=int, default=20000, help="fbin INSERT 批量大小")
@@ -1019,6 +1028,11 @@ def main():
         "--ann-s3-refresh",
         action="store_true",
         help="强制从 S3 重新下载 dataset.ann_s3 中的 ann 文件",
+    )
+    run_parser.add_argument(
+        "--fbin-s3-refresh",
+        action="store_true",
+        help="强制从 S3 重新下载 dataset.fbin_s3 中的 fbin/ibin",
     )
 
     args = parser.parse_args()
