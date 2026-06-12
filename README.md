@@ -40,6 +40,33 @@ cp cfg/s3_credentials.example.json cfg/s3_credentials.json
 | `dataset.s3` | 可选，S3 LOAD DATA 导入路径 |
 | `dataset.ann_s3` | 可选，召回用 ann 文件在 S3 上的位置 |
 
+#### `cfg.index` 建库参数（走 CREATE INDEX SQL，不再用 session 变量）
+
+索引构建参数统一写在 `cfg.index` 块里，由 `create_index` 直接拼进 `CREATE INDEX ...` 语句；
+不再依赖 `cfg.env` 里的 `SET kmeans_train_percent` / `SET *_max_index_capacity` 会话变量
+（CREATE INDEX 显式参数优先于会话变量，见 MO `ivfpq_create_gpu.go` 的 "flat algo_params key wins"）。
+`cfg.env` 仅保留真正的会话级开关（搜索期 `probe_limit`、`experimental_*_index`、`*_batch_window` 等）。
+
+| index 字段 | 适用索引 | 说明 / 生成的 SQL |
+|---|---|---|
+| `quantization` | **ivfflat** / cagra / ivfpq | ivfflat 现已支持：`float32`（不压缩，默认）/ `float16` / `bf16` / `int8` / `uint8`。条目按该窄类型存储（质心仍为 f32）；`int8`/`uint8` 走训练好的标量量化器。→ `quantization "int8"` |
+| `kmeans_train_percent` | ivfflat / ivfpq | kmeans 训练采样百分比（> 0 才生效）。→ `kmeans_train_percent 10` |
+| `kmeans_max_iteration` | ivfflat / ivfpq | kmeans 最大迭代次数（> 0 才生效）。→ `kmeans_max_iteration 20` |
+| `max_index_capacity` | cagra / ivfpq | 索引容量上限；**填 0 表示由服务端按行数自动决定**（不写入 SQL）。ivfflat 不支持，会被忽略。→ `max_index_capacity 1000000` |
+| `lists` | ivfflat / ivfpq | 聚类中心数。 |
+
+ivfflat 量化示例（`int8` 条目，f32 基列不变）：
+
+```json
+"index": {
+  "name": "idx_l2", "type": "ivfflat",
+  "lists": 1000, "op_type": "vector_l2_ops",
+  "quantization": "int8",
+  "kmeans_train_percent": 10,
+  "kmeans_max_iteration": 20
+}
+```
+
 ### 3. 下载 Wiki-all 数据集
 
 使用 [cuVS Bench Wiki-all 数据集](https://docs.rapids.ai/api/cuvs/nightly/cuvs_bench/wiki_all_dataset/) 进行测试（真实数据，**768 维**向量，`.fbin` 为 float32 二进制格式）。
