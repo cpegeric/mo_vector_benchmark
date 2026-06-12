@@ -22,6 +22,7 @@
   },
   "dimension": 768,
   "env": {
+    "experimental_ivfpq_index": 1,
     "probe_limit": 128,
     "ivfpq_batch_window": 0
   },
