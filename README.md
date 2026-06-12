@@ -144,6 +144,33 @@ python run_wiki.py <command> --config cfg/xxx.json [options]
 
 多 .fbin 时，全局 1-based 行号 `i` 跨文件连续递增（shard0: 1..N0，shard1: N0+1..N0+N1 ...），保持 `file_id` / `page_num` / `content` / `meta` 分布不变。
 
+#### 3.2 `cfg.index` 配置项（建库参数走 CREATE INDEX SQL，不再用 session 变量）
+
+索引构建参数现在统一写在 `cfg.index` 块里，由 `create_index` 直接拼进 `CREATE INDEX ...` 语句；
+不再依赖 `cfg.env` 里的 `SET kmeans_train_percent` / `SET *_max_index_capacity` 会话变量
+（CREATE INDEX 显式参数优先于会话变量，见 MO `ivfpq_create_gpu.go` 的 "flat algo_params key wins"）。
+`cfg.env` 仅保留真正的会话级开关（搜索期 `probe_limit`、`experimental_*_index`、`*_batch_window` 等）。
+
+| index 字段 | 适用索引 | 说明 / 生成的 SQL |
+|---|---|---|
+| `quantization` | **ivfflat** / cagra / ivfpq | ivfflat 现已支持：`float32`（不压缩，默认）/ `float16` / `bf16` / `int8` / `uint8`。条目按该窄类型存储（质心仍为 f32）；`int8`/`uint8` 走训练好的标量量化器。→ `quantization "int8"` |
+| `kmeans_train_percent` | ivfflat / ivfpq | kmeans 训练采样百分比。→ `kmeans_train_percent 10` |
+| `kmeans_max_iteration` | ivfflat / ivfpq | kmeans 最大迭代次数。→ `kmeans_max_iteration 20` |
+| `max_index_capacity` | cagra / ivfpq | 索引容量上限（**ivfflat 不支持，会被忽略**）。→ `max_index_capacity 1000000` |
+| `lists` | ivfflat / ivfpq | 聚类中心数。 |
+
+ivfflat 量化示例（`int8` 条目，f32 基列不变）：
+
+```json
+"index": {
+  "name": "idx_l2", "type": "ivfflat",
+  "lists": 1000, "op_type": "vector_l2_ops",
+  "quantization": "int8",
+  "kmeans_train_percent": 10,
+  "kmeans_max_iteration": 20
+}
+```
+
 **典型用法**
 
 ```bash

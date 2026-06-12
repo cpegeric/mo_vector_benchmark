@@ -14,17 +14,21 @@
     "quantization": "float32",
     "op_type": "vector_l2_ops",
     "distribution_mode": "single",
-    "include": ["file_id"]
+    "include": [
+      "file_id"
+    ],
+    "max_index_capacity": 0,
+    "kmeans_train_percent": 10
   },
   "dimension": 768,
   "env": {
     "probe_limit": 64,
-    "ivfpq_max_index_capacity": 1000000,
-    "ivfpq_batch_window": 0,
-    "kmeans_train_percent": 10
+    "ivfpq_batch_window": 0
   },
   "dataset": {
-    "base_fbin": ["/home/ubuntu/github/vector_benchmark/wiki_all_1M/base.1M.fbin"],
+    "base_fbin": [
+      "/home/ubuntu/github/vector_benchmark/wiki_all_1M/base.1M.fbin"
+    ],
     "query_fbin": "/home/ubuntu/github/vector_benchmark/wiki_all_1M/queries.fbin",
     "groundtruth_ibin": "/home/ubuntu/github/vector_benchmark/wiki_all_1M/groundtruth.1M.neighbors.ibin",
     "id_offset": 1
