@@ -1,0 +1,54 @@
+service-type = "CN"
+data-dir = "./mo-data"
+
+[log]
+level = "info"
+
+[cn]
+uuid = "dd1dccb4-4d3c-41f8-b482-5251dc7a41bf"
+port-base = 18000
+
+[cn.txn]
+enable-leak-check = 1
+max-active-ages = "20m"
+
+[cn.Engine]
+# only prefetch the matched db.table
+prefetch-on-subscribed = [
+    '^mo_catalog\.mo_tables$',
+    '^mysql\..*$',
+    '^test1\..*$',
+    '^test2\.t1$',
+]
+
+
+[[fileservice]]
+name = "LOCAL"
+backend = "DISK"
+
+[[fileservice]]
+name = "SHARED"
+backend = "DISK"
+data-dir = "mo-data/shared"
+
+[fileservice.cache]
+memory-capacity = "20GB"
+disk-capacity = "8GB"
+disk-path = "mo-data/file-service-cache"
+disk-min-evict-interval = "7m"
+disk-evict-target = 0.8
+
+[[fileservice]]
+name = "ETL"
+backend = "DISK-ETL"
+
+[observability]
+disableMetric = false
+metricUpdateStorageUsageInterval = "15m"
+enableStmtMerge = true
+enable-metric-to-prom = true
+status-port = 7001
+
+[malloc]
+check-fraction = 65536
+enable-metrics = true
