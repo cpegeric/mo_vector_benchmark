@@ -303,12 +303,31 @@ def run_wiki_create_table(args):
             password=args.password,
             database=args.database,
         )
+        # Base (embedding) column type is configurable via cfg.base_type so the
+        # same wiki dataset can be loaded into f32 / f16 / bf16 / int8 / uint8
+        # columns (LOAD DATA casts the f32 text to the narrow type). dimension is
+        # also read from cfg (default 768).
+        _BASE_TYPE_SQL = {
+            "f32": "VECF32", "float32": "VECF32",
+            "f16": "VECF16", "float16": "VECF16",
+            "bf16": "VECBF16",
+            "int8": "VECINT8", "i8": "VECINT8",
+            "uint8": "VECUINT8", "u8": "VECUINT8",
+        }
+        _cfg = getattr(args, "_index_config", None) or {}
+        _base_type = str(_cfg.get("base_type", "f32")).lower()
+        _dim = int(_cfg.get("dimension", 768))
+        if _base_type not in _BASE_TYPE_SQL:
+            print(f"错误: 未知 base_type: {_base_type}（支持 {sorted(_BASE_TYPE_SQL)}）")
+            return 1
+        _col_type = f"{_BASE_TYPE_SQL[_base_type]}({_dim})"
+        print(f"  embedding 列类型: {_col_type}")
         create_table_sql = f"""
         CREATE TABLE `{args.table}` (
             `id` BIGINT NOT NULL AUTO_INCREMENT COMMENT '主键',
             `file_id` BIGINT NOT NULL,
             `content` TEXT DEFAULT NULL,
-            `embedding` VECF32(768) DEFAULT NULL,
+            `embedding` {_col_type} DEFAULT NULL,
             `page_num` INT NOT NULL DEFAULT 0,
             `meta` JSON DEFAULT NULL,
             PRIMARY KEY (`id`),

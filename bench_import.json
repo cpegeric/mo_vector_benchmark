@@ -1,0 +1,32 @@
+{
+  "f32": {
+    "db": "wiki_f32",
+    "rows": 1000000,
+    "import_s": 111.4,
+    "ok": true
+  },
+  "f16": {
+    "db": "wiki_f16",
+    "rows": 1000000,
+    "import_s": 164.7,
+    "ok": true
+  },
+  "bf16": {
+    "db": "wiki_bf16",
+    "rows": 1000000,
+    "import_s": 172.7,
+    "ok": true
+  },
+  "int8": {
+    "db": "wiki_i8",
+    "rows": 1000000,
+    "import_s": 148.4,
+    "ok": true
+  },
+  "uint8": {
+    "db": "wiki_u8",
+    "rows": 1000000,
+    "import_s": 87.7,
+    "ok": true
+  }
+}

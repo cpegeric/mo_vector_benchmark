@@ -430,7 +430,8 @@ def main() -> int:
         if validate_import_paths(ns):
             return 1
         label, fn = run_import_step(ns, log_prefix="[run_wiki]")
-        return _run_step(label, fn)
+        # run_import_step's closures take no args; adapt to _run_step's fn(ns).
+        return _run_step(label, lambda _ns: fn())
 
     if cmd == "create_index":
         return _run_step("create-index", run_wiki_create_index)
