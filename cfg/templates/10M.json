@@ -17,7 +17,7 @@
     "ivfpq_lists": 4096,
     "ivfpq_m": 192,
     "ivfpq_bits_per_code": 8,
-    "probe_ivfflat": 5,
+    "probe_ivfflat": 8,
     "probe_ivfpq": 16,
     "distribution_mode": "single",
     "kmeans_train_percent": 2,
