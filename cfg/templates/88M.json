@@ -18,7 +18,7 @@
     "ivfpq_m": 192,
     "ivfpq_bits_per_code": 8,
     "probe_ivfflat": 20,
-    "probe_ivfpq": 128,
+    "probe_ivfpq": 16,
     "distribution_mode": "sharded",
     "kmeans_train_percent": 2,
     "kmeans_max_iteration": 20,
