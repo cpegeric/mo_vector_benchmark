@@ -484,6 +484,17 @@ run_matrix.py  = sweep base×quant cells for one --algo, generating configs + ca
 - `ivfpq` / `cagra` (GPU/cuVS): f32/f16 base + {float16,int8,uint8} quant on f32,
   {int8,uint8} quant on f16. (No bf16; int8/uint8 are L2-only.)
 
+One invocation runs the **whole** cell-set for `--algo`. Narrow it with:
+
+- `--base {all,f32,f16,bf16,int8,uint8}` — run only one base type (default all).
+- `--quantize {all,none,float16,bf16,int8,uint8}` — run only one quantization;
+  `none` = the base-sweep cells (entries keep the base type). Default all.
+
+So `--base f32 --quantize int8` runs the single f32→int8 cell; `--base f32` runs
+all f32 cells; `--quantize none` runs just the base-sweep. Pairs with
+`--create-table`/`--drop-tables` to do one base group at a time without waiting
+for the rest.
+
 ### Table lifecycle (memory vs reload)
 
 Table create/drop is controlled by explicit flags (like `run_wiki.py`); the

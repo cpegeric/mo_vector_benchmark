@@ -63,6 +63,19 @@ def cells(algo):
     return out
 
 
+def select_cells(algo, base="all", quantize="all"):
+    """cells(algo) filtered by --base / --quantize ('all' = no filter). quantize
+    'none' selects the base-sweep cells (entries keep the base type)."""
+    out = []
+    for kind, b, q in cells(algo):
+        if base != "all" and b != base:
+            continue
+        if quantize != "all" and q != quantize:
+            continue
+        out.append((kind, b, q))
+    return out
+
+
 def load_template(scale):
     p = os.path.join(HERE, "cfg", "templates", f"{scale}.json")
     if not os.path.exists(p):
@@ -209,12 +222,12 @@ def drop_database(tmpl, db):
         print(f"!! drop database {db} failed: {e}")
 
 
-def phase_import(algo, scale, tmpl, data_root, distribution):
+def phase_import(algo, scale, tmpl, data_root, distribution, base="all", quantize="all"):
     # Standalone bulk import for the persistent workflow (run before --phase matrix
-    # with no table flags). Import only the base types this algo's matrix
+    # with no table flags). Import only the base types the (filtered) matrix
     # references — GPU algos need just f32/f16.
     results = {}
-    for bt in sorted({b for _, b, _ in cells(algo)}):
+    for bt in sorted({b for _, b, _ in select_cells(algo, base, quantize)}):
         db = dbname(scale, bt)
         print(f"\n===== IMPORT scale={scale} base={bt} db={db} =====", flush=True)
         ok, rows = import_base(algo, bt, db, scale, tmpl, data_root, distribution)
@@ -287,7 +300,8 @@ def run_one_cell(tag, algo, scale, kind, base, quant, db, tmpl, data_root, distr
     return rec
 
 
-def phase_matrix(tag, algo, scale, tmpl, data_root, distribution, create_table, drop_tables):
+def phase_matrix(tag, algo, scale, tmpl, data_root, distribution, create_table, drop_tables,
+                 base="all", quantize="all"):
     rows = []
     # Cells are grouped by base table (preserving order) so all cells that share a
     # base table run together. Table lifecycle is controlled explicitly, like
@@ -299,24 +313,28 @@ def phase_matrix(tag, algo, scale, tmpl, data_root, distribution, create_table, 
     #   (neither)      : reuse pre-existing tables (run --phase import first, or a
     #                    prior --create-table run); fair per-cell index state is
     #                    still guaranteed by the drop_index inside each cell.
+    selected = select_cells(algo, base, quantize)
+    if not selected:
+        print(f"!! no cells match base={base} quantize={quantize} for algo={algo}")
+        return
     order, by_base = [], {}
-    for c in cells(algo):
+    for c in selected:
         b = c[1]
         if b not in by_base:
             by_base[b] = []; order.append(b)
         by_base[b].append(c)
 
-    for base in order:
-        db = dbname(scale, base)
+    for base_t in order:
+        db = dbname(scale, base_t)
         if create_table:
-            print(f"\n##### BASE {base} (db={db}) — create + load #####", flush=True)
-            ok, _ = import_base(algo, base, db, scale, tmpl, data_root, distribution)
+            print(f"\n##### BASE {base_t} (db={db}) — create + load #####", flush=True)
+            ok, _ = import_base(algo, base_t, db, scale, tmpl, data_root, distribution)
             if not ok:
-                print(f"!! import failed for base={base}; skipping its cells")
+                print(f"!! import failed for base={base_t}; skipping its cells")
                 continue
         try:
-            for kind, _b, quant in by_base[base]:
-                rows.append(run_one_cell(tag, algo, scale, kind, base, quant, db,
+            for kind, _b, quant in by_base[base_t]:
+                rows.append(run_one_cell(tag, algo, scale, kind, base_t, quant, db,
                                          tmpl, data_root, distribution))
                 # checkpoint after each cell
                 json.dump(rows, open(os.path.join(HERE, f"bench_matrix_{tag}.json"), "w"), indent=2)
@@ -341,6 +359,13 @@ if __name__ == "__main__":
     ap.add_argument("--tag", default=None, help="bench_matrix_{tag}.json (default: --algo)")
     ap.add_argument("--passes", type=int, default=PASSES,
                     help="query passes per cell (pass1=cold, warm=median(rest))")
+    ap.add_argument("--base", default="all",
+                    choices=["all", "f32", "f16", "bf16", "int8", "uint8"],
+                    help="restrict the run to one base type (default: all)")
+    ap.add_argument("--quantize", default="all",
+                    choices=["all", "none", "float16", "bf16", "int8", "uint8"],
+                    help="restrict to one quantization; 'none' = base-sweep cells "
+                         "(entries keep the base type). Default: all")
     ap.add_argument("--create-table", action="store_true",
                     help="create + load each base table before its cells (import). Omit to "
                          "reuse pre-existing tables (run --phase import first, or a prior "
@@ -356,7 +381,7 @@ if __name__ == "__main__":
     tag = a.tag or a.algo
     PASSES = a.passes
     if a.phase == "import":
-        phase_import(a.algo, a.scale, tmpl, a.data_root, distribution)
+        phase_import(a.algo, a.scale, tmpl, a.data_root, distribution, a.base, a.quantize)
     else:
         phase_matrix(tag, a.algo, a.scale, tmpl, a.data_root, distribution,
-                     a.create_table, a.drop_tables)
+                     a.create_table, a.drop_tables, a.base, a.quantize)
