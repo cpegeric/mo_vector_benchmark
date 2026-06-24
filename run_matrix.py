@@ -1,75 +1,143 @@
 #!/usr/bin/env python3
-"""run_matrix.py — wiki_all 1M ivfflat benchmark matrix driver.
+"""run_matrix.py — wiki_all benchmark matrix driver (ivfflat / ivfpq / cagra).
 
-Sweeps base column type x index quantization for ivfflat, recording index build
-time, recall@k and search latency/QPS. Designed to be re-run under each MO build
-config (GPU+SIMD / GPU+non-SIMD / non-GPU+SIMD / non-GPU+non-SIMD); the imported
-tables persist on disk across MO restarts, so --phase import runs ONCE and
---phase matrix runs per build config.
+Sweeps base column type x index quantization for ONE index algorithm, recording
+index build time, recall@k and search latency/QPS.
 
-  python run_matrix.py --phase import                      # once (any build)
-  python run_matrix.py --phase matrix --tag gpu_simd       # per build config
+run_matrix.py orchestrates run_wiki.py (the per-operation tool) for each cell:
+  drop_index -> create_index (timed) -> recall x N passes -> drop_index.
+run_wiki.py is config-driven and algorithm-agnostic; run_matrix.py is the sweep
+driver that GENERATES a per-cell config and calls run_wiki.py for each step.
+
+Scale (1M/10M/88M), GPU distribution mode (single/sharded) and the dataset root
+are configurable. Per-scale tuning (lists, probe, graph degrees) and dataset
+paths come from a committed template: cfg/templates/<scale>.json. Dataset paths
+in the template are RELATIVE to --data-root, so templates stay machine-neutral.
+
+  # import once per (scale, algo-base-set); tables persist across MO restarts
+  python run_matrix.py --phase import --scale 1M --algo ivfpq
+  # run the matrix per algorithm / distribution
+  python run_matrix.py --phase matrix --scale 1M  --algo ivfpq
+  python run_matrix.py --phase matrix --scale 10M --algo cagra --distribution sharded
+
+Generated per-cell configs are written to cfg/bench/ (git-ignored).
 """
 from __future__ import annotations
 
 import argparse, json, os, re, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DATA = "/home/eric/github/vector_benchmark/wiki_all_1M"
-F32_PREFIX = f"{DATA}/gen/base.1M"                 # base.1M0..3.csv (f32 text)
-I8_PREFIX  = f"{DATA}/gen_narrow/base.i8_"          # base.i8_0.csv  (int8 scaled)
-U8_PREFIX  = f"{DATA}/gen_narrow/base.u8_"          # base.u8_0.csv  (uint8 scaled)
+# Dataset root for the RELATIVE paths in cfg/templates/<scale>.json. Defaults to
+# this repo dir, so datasets live under (or are symlinked into) mo_vector_benchmark
+# itself. Override with --data-root or $WIKI_DATA_ROOT.
+DEFAULT_DATA_ROOT = os.environ.get("WIKI_DATA_ROOT", HERE)
 
-# base_type -> (database, load csv prefix)
-BASES = {
-    "f32":  ("wiki_f32",  F32_PREFIX),
-    "f16":  ("wiki_f16",  F32_PREFIX),
-    "bf16": ("wiki_bf16", F32_PREFIX),
-    "int8": ("wiki_i8",   I8_PREFIX),
-    "uint8":("wiki_u8",   U8_PREFIX),
-}
 QUANTS = ["float32", "float16", "bf16", "int8", "uint8"]
 
-# Matrix cells: base sweep (no quantization → entries keep the base column type)
-# + quant sweep (base=f32, entries downcast to the named quantization).
-# NOTE: base cells must NOT pass quantization='float32'. That overrides the entry
-# type to f32, so a narrow base (bf16/f16/int8/uint8) would store f32 entries and
-# the re-rank would run the f32 distance kernel over upcast data — measuring an f32
-# index, not the narrow one (and now an outright error, since upcasting is rejected
-# in schema.go). 'none' omits the QUANTIZATION clause so entries = base type.
-def cells():
-    out = [("base", b, "none") for b in BASES]                    # 5 base-sweep
-    out += [("quant", "f32", q) for q in QUANTS if q != "float32"] # 4 quant-sweep
-    return out
-
-DATASET = {
-    "query_fbin": f"{DATA}/queries.fbin",
-    "groundtruth_ibin": f"{DATA}/groundtruth.1M.neighbors.ibin",
-    "id_offset": 1,
-}
-LISTS = 1000
-PROBE = 8           # probe_limit: ~0.91 recall@10, ~0.9s/query (32 was ~4s/q, I/O-bound)
 N_QUERIES = 200
-K = 10
+K = 20
 CONCURRENCY = 8
 PASSES = 4          # query passes per cell: pass1=cold, warm = median(pass2..N)
 
 
-def make_cfg(base_type, quant, database):
-    return {
-        "host": "127.0.0.1", "port": 6001, "user": "dump", "password": "111",
+# Matrix cells: base sweep (no quantization → entries keep the base column type)
+# + quant sweep (base=f32/f16, entries downcast to the named quantization).
+# NOTE: base cells must NOT pass quantization='float32'. That overrides the entry
+# type to f32, so a narrow base (bf16/f16/int8/uint8) would store f32 entries and
+# the re-rank would run the f32 distance kernel over upcast data — measuring an f32
+# index, not the narrow one (and an outright error, since upcasting is rejected in
+# schema.go). 'none' omits the QUANTIZATION clause so entries = base type.
+def cells(algo):
+    if algo == "ivfflat":
+        # CPU ivfflat supports every base type + every narrow quantization.
+        out = [("base", b, "none") for b in ["f32", "f16", "bf16", "int8", "uint8"]]
+        out += [("quant", "f32", q) for q in QUANTS if q != "float32"]   # 4 quant
+        return out
+    # cuvs (ivfpq/cagra): base column is f32/f16 only; bf16 has no GPU storage;
+    # int8/uint8 are L2-only (op_type is l2 here) and cannot be a base column.
+    # So: f32/f16 base (native), + f16/int8/uint8 quant on f32 base,
+    # + int8/uint8 quant on f16 base. (No bf16/int8/uint8 base, no bf16 quant.)
+    out = [("base", "f32", "none"), ("base", "f16", "none")]
+    out += [("quant", "f32", q) for q in ["float16", "int8", "uint8"]]
+    out += [("quant", "f16", q) for q in ["int8", "uint8"]]
+    return out
+
+
+def load_template(scale):
+    p = os.path.join(HERE, "cfg", "templates", f"{scale}.json")
+    if not os.path.exists(p):
+        raise SystemExit(f"template not found: {p}")
+    return json.load(open(p))
+
+
+def dbname(scale, base):
+    return f"wiki{scale.lower()}_{base}"
+
+
+def abspath(data_root, rel):
+    return rel if os.path.isabs(rel) else os.path.join(data_root, rel)
+
+
+def csv_prefix_for(base, ds, data_root):
+    # f32/f16/bf16 load from the f32 text CSV (the column type does the cast);
+    # int8/uint8 need integer-scaled CSVs (separate narrow set).
+    if base == "int8":
+        rel = ds.get("csv_prefix_int8")
+    elif base == "uint8":
+        rel = ds.get("csv_prefix_uint8")
+    else:
+        rel = ds.get("csv_prefix")
+    return abspath(data_root, rel) if rel else None
+
+
+def make_cfg(algo, base_type, quant, database, tmpl, data_root, distribution):
+    ds, tun = tmpl["dataset"], tmpl["tuning"]
+    qval = "" if quant == "none" else quant
+    cfg = {
+        "host": tmpl.get("host", "127.0.0.1"), "port": tmpl.get("port", 6001),
+        "user": tmpl.get("user", "dump"), "password": tmpl.get("password", "111"),
         "database": database, "table": "hfb",
-        "base_type": base_type, "dimension": 768,
-        "index": {
-            "name": "idx_l2", "type": "ivfflat", "lists": LISTS,
-            # 'none' (base sweep) omits the QUANTIZATION clause so the index entries
-            # keep the base column type; a real quant name downcasts the entries.
-            "op_type": "vector_l2_ops", "quantization": ("" if quant == "none" else quant),
-            "kmeans_train_percent": 10, "kmeans_max_iteration": 20,
+        "base_type": base_type, "dimension": tmpl.get("dimension", 768),
+        "dataset": {
+            "query_fbin": abspath(data_root, ds["query_fbin"]),
+            "groundtruth_ibin": abspath(data_root, ds["groundtruth_ibin"]),
+            "id_offset": ds.get("id_offset", 1),
         },
-        "env": {"probe_limit": PROBE, "ivf_preload_entries": 0},
-        "dataset": DATASET,
     }
+    # 'none' (base sweep) omits QUANTIZATION so entries keep the base column type;
+    # a real quant name downcasts the entries.
+    if algo == "ivfflat":
+        cfg["index"] = {
+            "name": "idx_l2", "type": "ivfflat", "lists": tun["ivfflat_lists"],
+            "op_type": "vector_l2_ops", "quantization": qval,
+            "kmeans_train_percent": tun.get("kmeans_train_percent", 10),
+            "kmeans_max_iteration": tun.get("kmeans_max_iteration", 20),
+        }
+        cfg["env"] = {"probe_limit": tun["probe_ivfflat"], "ivf_preload_entries": 0}
+    elif algo == "ivfpq":
+        cfg["index"] = {
+            "name": "idx_l2", "type": "ivfpq", "lists": tun["ivfpq_lists"],
+            "m": tun.get("ivfpq_m", 192), "bits_per_code": tun.get("ivfpq_bits_per_code", 8),
+            "op_type": "vector_l2_ops", "quantization": qval,
+            "distribution_mode": distribution, "max_index_capacity": 0,
+            "kmeans_train_percent": tun.get("kmeans_train_percent", 10),
+        }
+        cfg["env"] = {"experimental_ivfpq_index": 1, "probe_limit": tun["probe_ivfpq"],
+                      "ivfpq_batch_window": 0}
+    elif algo == "cagra":
+        cg = tun["cagra"]
+        cfg["index"] = {
+            "name": "idx_l2", "type": "cagra",
+            "intermediate_graph_degree": cg["intermediate_graph_degree"],
+            "graph_degree": cg["graph_degree"], "itopk_size": cg["itopk_size"],
+            "op_type": "vector_l2_ops", "quantization": qval,
+            "distribution_mode": distribution, "max_index_capacity": 0,
+        }
+        cfg["env"] = {"experimental_cagra_index": 1, "cagra_batch_window": 0,
+                      "cagra_threads_build": 0, "cagra_threads_search": 0}
+    else:
+        raise SystemExit(f"unknown algo {algo}")
+    return cfg
 
 
 def write_cfg(cfg, name):
@@ -106,60 +174,71 @@ def parse_recall(out):
     return m
 
 
-def phase_import():
+def phase_import(algo, scale, tmpl, data_root, distribution):
     results = {}
-    for bt, (db, prefix) in BASES.items():
-        cfg = make_cfg(bt, "float32", db)
-        p = write_cfg(cfg, f"import_{bt}.json")
-        print(f"\n===== IMPORT base={bt} db={db} prefix={prefix} =====", flush=True)
+    ds = tmpl["dataset"]
+    # Import only the base types this algo's matrix references — GPU algos need
+    # just f32/f16, so 10M/88M scales without narrow CSVs still import cleanly.
+    bases = sorted({b for _, b, _ in cells(algo)})
+    for bt in bases:
+        db = dbname(scale, bt)
+        prefix = csv_prefix_for(bt, ds, data_root)
+        if not prefix:
+            print(f"!! no csv prefix configured for base={bt}; skip"); continue
+        cfg = make_cfg(algo, bt, "float32", db, tmpl, data_root, distribution)
+        p = write_cfg(cfg, f"import_{scale}_{bt}.json")
+        print(f"\n===== IMPORT scale={scale} base={bt} db={db} prefix={prefix} =====", flush=True)
         rc, out, _ = run(py("create_table", "--config", p))
         if rc:
             print(out[-2000:]); print(f"!! create_table failed base={bt}"); continue
         rc, out, dt = run(py("import", "--config", p, "--input-csv-prefix", prefix))
         ok = rc == 0 and "失败" not in out
-        aff = re.findall(r"affected_rows=(\d+)", out)
-        rows = sum(int(x) for x in aff)
+        rows = sum(int(x) for x in re.findall(r"affected_rows=(\d+)", out))
         print(f"   import base={bt}: rows={rows} time={dt:.1f}s ok={ok}")
         if not ok:
             print(out[-2000:])
         results[bt] = {"db": db, "rows": rows, "import_s": round(dt, 1), "ok": ok}
-    json.dump(results, open(os.path.join(HERE, "bench_import.json"), "w"), indent=2)
-    print("\nIMPORT SUMMARY:", json.dumps(results, indent=2))
+    out_p = os.path.join(HERE, f"bench_import_{scale}.json")
+    json.dump(results, open(out_p, "w"), indent=2)
+    print(f"\nIMPORT[{scale}] SUMMARY:", json.dumps(results, indent=2))
 
 
-def phase_matrix(tag):
-    global PASSES
+def phase_matrix(tag, algo, scale, tmpl, data_root, distribution):
     rows = []
-    for kind, base, quant in cells():
-        db, _ = BASES[base]
-        cfg = make_cfg(base, quant, db)
-        name = f"{tag}_{kind}_{base}_{quant}.json"
+    probe_flat = tmpl["tuning"]["probe_ivfflat"]
+    for kind, base, quant in cells(algo):
+        db = dbname(scale, base)
+        cfg = make_cfg(algo, base, quant, db, tmpl, data_root, distribution)
+        name = f"{tag}_{scale}_{kind}_{base}_{quant}.json"
         p = write_cfg(cfg, name)
-        label = f"{kind}: base={base} quant={quant} db={db}"
+        label = f"{kind}: base={base} quant={quant} db={db} dist={distribution}"
         print(f"\n===== {label} =====", flush=True)
         # drop any existing index, then build (timed), then recall.
         run(py("drop_index", "--config", p))
         rc, out, build_s = run(py("create_index", "--config", p))
         if rc:
-            print(out[-1500:]); rows.append({"tag": tag, "kind": kind, "base": base,
-                "quant": quant, "build_s": None, "error": "build_failed"}); continue
+            print(out[-1500:]); rows.append({"tag": tag, "scale": scale, "kind": kind,
+                "base": base, "quant": quant, "build_s": None, "error": "build_failed"})
+            continue
+
         def run_recall():
             if base in ("int8", "uint8"):
                 # int8/uint8 base columns need integer-scaled query literals (the f32
                 # query can't cast to the narrow column); recall_narrow.py handles it.
                 return run([sys.executable, os.path.join(HERE, "recall_narrow.py"),
                     "--database", db, "--table", "hfb", "--mode", base,
-                    "--query-fbin", DATASET["query_fbin"], "--groundtruth-ibin", DATASET["groundtruth_ibin"],
-                    "-n", str(N_QUERIES), "-k", str(K), "--probe", str(PROBE),
-                    "--concurrency", str(CONCURRENCY), "--id-offset", str(DATASET["id_offset"])])
+                    "--query-fbin", abspath(data_root, tmpl["dataset"]["query_fbin"]),
+                    "--groundtruth-ibin", abspath(data_root, tmpl["dataset"]["groundtruth_ibin"]),
+                    "-n", str(N_QUERIES), "-k", str(K), "--probe", str(probe_flat),
+                    "--concurrency", str(CONCURRENCY),
+                    "--id-offset", str(tmpl["dataset"].get("id_offset", 1))])
             return run(py("recall", "--config", p, "--gt-source", "fbin",
                          "-n", str(N_QUERIES), "-k", str(K), "--concurrency", str(CONCURRENCY)))
 
         # Cold/warm: pass 1 reads the freshly-built (uncached) index entry blocks
-        # cold; later passes hit the warm fileservice cache. The build runs with
-        # SkipMemoryCacheWrites, so pass 1 is a true cold read. Warm QPS/p50 is the
-        # MEDIAN of the post-cold passes (not the single last pass) — a transient on
-        # any one warm pass otherwise tanks the cell (e.g. f32 once read 61 vs ~457).
+        # cold; later passes hit the warm fileservice cache. Warm QPS/p50 is the
+        # MEDIAN of the post-cold passes (a transient on any one warm pass otherwise
+        # tanks the cell).
         passes_met = []
         for pi in range(PASSES):
             _rc, out, _ = run_recall()
@@ -173,13 +252,13 @@ def phase_matrix(tag):
             return vals[len(vals) // 2] if vals else None
 
         cold = passes_met[0]
-        warm_passes = passes_met[1:] or passes_met  # drop cold; fallback if PASSES==1
+        warm_passes = passes_met[1:] or passes_met
         warm_qps = _median([m.get("qps") for m in warm_passes])
         warm_p50 = _median([m.get("lat_p50") for m in warm_passes])
         warm_recall = next((m.get("recall") for m in warm_passes if m.get("recall") is not None),
                            cold.get("recall"))
-        rec = {"tag": tag, "kind": kind, "base": base, "quant": quant,
-               "build_s": round(build_s, 1),
+        rec = {"tag": tag, "scale": scale, "kind": kind, "base": base, "quant": quant,
+               "distribution": distribution, "build_s": round(build_s, 1),
                "recall": warm_recall,
                "qps_cold": cold.get("qps"), "qps_warm": warm_qps,
                "p50_cold": cold.get("lat_p50"), "p50_warm": warm_p50,
@@ -197,12 +276,25 @@ def phase_matrix(tag):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--phase", required=True, choices=["import", "matrix"])
-    ap.add_argument("--tag", default="run")
+    ap.add_argument("--algo", default="ivfflat", choices=["ivfflat", "ivfpq", "cagra"],
+                    help="index algorithm; selects index params + valid cell-set")
+    ap.add_argument("--scale", default="1M", choices=["1M", "10M", "88M"],
+                    help="dataset scale; loads cfg/templates/<scale>.json")
+    ap.add_argument("--distribution", default=None, choices=["single", "sharded"],
+                    help="GPU distribution mode (ivfpq/cagra); default: template's value. "
+                         "Use 'sharded' when one GPU lacks memory for the dataset (e.g. 10M).")
+    ap.add_argument("--data-root", default=DEFAULT_DATA_ROOT,
+                    help=f"root for relative dataset paths in the template (default: {DEFAULT_DATA_ROOT})")
+    ap.add_argument("--tag", default=None, help="bench_matrix_{tag}.json (default: --algo)")
     ap.add_argument("--passes", type=int, default=PASSES,
-                    help="query passes per cell (pass1=cold, last=warm)")
+                    help="query passes per cell (pass1=cold, warm=median(rest))")
     a = ap.parse_args()
+
+    tmpl = load_template(a.scale)
+    distribution = a.distribution or tmpl["tuning"].get("distribution_mode", "single")
+    tag = a.tag or a.algo
+    PASSES = a.passes
     if a.phase == "import":
-        phase_import()
+        phase_import(a.algo, a.scale, tmpl, a.data_root, distribution)
     else:
-        PASSES = a.passes
-        phase_matrix(a.tag)
+        phase_matrix(tag, a.algo, a.scale, tmpl, a.data_root, distribution)

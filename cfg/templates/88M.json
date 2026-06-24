@@ -1,0 +1,31 @@
+{
+  "host": "127.0.0.1",
+  "port": 6001,
+  "user": "dump",
+  "password": "111",
+  "dimension": 768,
+  "dataset": {
+    "csv_prefix": "data/wiki_all_88M/gen/base.88M",
+    "csv_prefix_int8": "data/wiki_all_88M/gen_narrow/base.i8_",
+    "csv_prefix_uint8": "data/wiki_all_88M/gen_narrow/base.u8_",
+    "query_fbin": "data/wiki_all_88M/queries.fbin",
+    "groundtruth_ibin": "data/wiki_all_88M/groundtruth.88M.neighbors.ibin",
+    "id_offset": 1
+  },
+  "tuning": {
+    "ivfflat_lists": 10000,
+    "ivfpq_lists": 6000,
+    "ivfpq_m": 192,
+    "ivfpq_bits_per_code": 8,
+    "probe_ivfflat": 20,
+    "probe_ivfpq": 128,
+    "distribution_mode": "sharded",
+    "kmeans_train_percent": 2,
+    "kmeans_max_iteration": 20,
+    "cagra": {
+      "intermediate_graph_degree": 256,
+      "graph_degree": 64,
+      "itopk_size": 256
+    }
+  }
+}

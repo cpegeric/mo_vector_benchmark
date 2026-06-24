@@ -449,3 +449,59 @@ python run_wiki.py recall --config cfg/ivfflat_10M.json \
 ```
 
 更多子命令说明：`python run_wiki.py -h`。
+
+---
+
+## 索引矩阵基准 run_matrix.py (base type × quantization sweep)
+
+`run_wiki.py` runs **one** operation against **one** config (any algorithm — the
+index type comes from the config). `run_matrix.py` is the **sweep driver**: for a
+chosen algorithm it generates a per-cell config and calls `run_wiki.py` for each
+`create_index → recall → drop_index`, recording build time, recall@k and QPS.
+
+```
+run_wiki.py    = one op,  one config   (create_table / import / create_index / recall)
+run_matrix.py  = sweep base×quant cells for one --algo, generating configs + calling run_wiki.py
+```
+
+### Scale, distribution, data root
+
+- `--scale {1M,10M,88M}` — loads `cfg/templates/<scale>.json` (per-scale dataset
+  paths + tuning: lists, probe, k-means %, cagra graph degrees).
+- `--distribution {single,sharded}` — GPU distribution for ivfpq/cagra. Defaults to
+  the template's value (1M/10M = `single`, 88M = `sharded`). Use `sharded` when one
+  GPU lacks memory for the dataset (e.g. 10M on a small card).
+- `--data-root PATH` — root for the **relative** dataset paths in the template.
+  Defaults to this repo dir, so put the datasets under the repo or symlink them:
+  ```
+  ln -s ../vector_benchmark/wiki_all_1M  wiki_all_1M
+  # or run with: --data-root ../vector_benchmark
+  ```
+
+### Algorithm cell-sets
+
+- `ivfflat` (CPU): 5 base types (f32/f16/bf16/int8/uint8) + 4 quant on f32 base.
+- `ivfpq` / `cagra` (GPU/cuVS): f32/f16 base + {float16,int8,uint8} quant on f32,
+  {int8,uint8} quant on f16. (No bf16; int8/uint8 are L2-only.)
+
+### Usage
+
+```sh
+# 0) one-time: point data-root at the datasets (symlink or --data-root)
+
+# 1) import once per scale (only the base tables the algo needs are loaded)
+python run_matrix.py --phase import --scale 1M --algo ivfpq
+
+# 2) run the matrix per algorithm; writes bench_matrix_<tag>.json (tag defaults to --algo)
+python run_matrix.py --phase matrix --scale 1M  --algo ivfflat
+python run_matrix.py --phase matrix --scale 1M  --algo ivfpq
+python run_matrix.py --phase matrix --scale 10M --algo cagra --distribution sharded
+
+# 3) compare algorithms side-by-side (reads bench_matrix_{ivfflat,ivfpq,cagra}.json)
+python aggregate.py
+```
+
+Generated per-cell configs land in `cfg/bench/` and the results in
+`bench_matrix_*.json` / `bench_import_*.json` — all git-ignored. Tip: on a small
+GPU, restart mo-service between algorithms so the RMM pool + fileservice cache do
+not accumulate across runs.
