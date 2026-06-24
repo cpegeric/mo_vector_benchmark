@@ -210,8 +210,9 @@ def drop_database(tmpl, db):
 
 
 def phase_import(algo, scale, tmpl, data_root, distribution):
-    # Standalone import for the --keep-tables persistent workflow. Import only the
-    # base types this algo's matrix references — GPU algos need just f32/f16.
+    # Standalone bulk import for the persistent workflow (run before --phase matrix
+    # with no table flags). Import only the base types this algo's matrix
+    # references — GPU algos need just f32/f16.
     results = {}
     for bt in sorted({b for _, b, _ in cells(algo)}):
         db = dbname(scale, bt)
@@ -286,14 +287,18 @@ def run_one_cell(tag, algo, scale, kind, base, quant, db, tmpl, data_root, distr
     return rec
 
 
-def phase_matrix(tag, algo, scale, tmpl, data_root, distribution, keep_tables):
+def phase_matrix(tag, algo, scale, tmpl, data_root, distribution, create_table, drop_tables):
     rows = []
-    # Group cells by base table, preserving order. The per-base table lifecycle
-    # (default) creates+loads a base table, runs all its cells, then DROPS it, so
-    # only ONE base table is resident at a time. Without it, every base table for
-    # the scale stays alive across the whole matrix (5 tables at once at 88M →
-    # OOM). --keep-tables opts into the persistent workflow: run --phase import
-    # first; tables are neither created nor dropped here.
+    # Cells are grouped by base table (preserving order) so all cells that share a
+    # base table run together. Table lifecycle is controlled explicitly, like
+    # run_wiki.py:
+    #   --create-table : create + load each base table before its cells (import).
+    #   --drop-tables  : drop each base table after its cells (frees its data, so
+    #                    only one base table is resident at a time — for memory-
+    #                    constrained boxes; skip it at 88M to avoid costly reloads).
+    #   (neither)      : reuse pre-existing tables (run --phase import first, or a
+    #                    prior --create-table run); fair per-cell index state is
+    #                    still guaranteed by the drop_index inside each cell.
     order, by_base = [], {}
     for c in cells(algo):
         b = c[1]
@@ -303,8 +308,8 @@ def phase_matrix(tag, algo, scale, tmpl, data_root, distribution, keep_tables):
 
     for base in order:
         db = dbname(scale, base)
-        if not keep_tables:
-            print(f"\n##### BASE {base} (db={db}) — import #####", flush=True)
+        if create_table:
+            print(f"\n##### BASE {base} (db={db}) — create + load #####", flush=True)
             ok, _ = import_base(algo, base, db, scale, tmpl, data_root, distribution)
             if not ok:
                 print(f"!! import failed for base={base}; skipping its cells")
@@ -316,7 +321,7 @@ def phase_matrix(tag, algo, scale, tmpl, data_root, distribution, keep_tables):
                 # checkpoint after each cell
                 json.dump(rows, open(os.path.join(HERE, f"bench_matrix_{tag}.json"), "w"), indent=2)
         finally:
-            if not keep_tables:
+            if drop_tables:
                 drop_database(tmpl, db)   # free the base table before the next base
     print(f"\nMATRIX[{tag}] SUMMARY:\n" + json.dumps(rows, indent=2))
 
@@ -336,10 +341,14 @@ if __name__ == "__main__":
     ap.add_argument("--tag", default=None, help="bench_matrix_{tag}.json (default: --algo)")
     ap.add_argument("--passes", type=int, default=PASSES,
                     help="query passes per cell (pass1=cold, warm=median(rest))")
-    ap.add_argument("--keep-tables", action="store_true",
-                    help="persistent workflow: do NOT import/drop tables in --phase matrix "
-                         "(run --phase import first). Default drops each base table after its "
-                         "cells so only one base table is resident at a time (avoids OOM).")
+    ap.add_argument("--create-table", action="store_true",
+                    help="create + load each base table before its cells (import). Omit to "
+                         "reuse pre-existing tables (run --phase import first, or a prior "
+                         "--create-table run). Load once at 88M, then reuse on re-runs.")
+    ap.add_argument("--drop-tables", action="store_true",
+                    help="drop each base table after its cells, so only one base table is "
+                         "resident at a time (memory-constrained boxes). Avoid at 88M — it "
+                         "forces a full reload on the next run.")
     a = ap.parse_args()
 
     tmpl = load_template(a.scale)
@@ -349,4 +358,5 @@ if __name__ == "__main__":
     if a.phase == "import":
         phase_import(a.algo, a.scale, tmpl, a.data_root, distribution)
     else:
-        phase_matrix(tag, a.algo, a.scale, tmpl, a.data_root, distribution, a.keep_tables)
+        phase_matrix(tag, a.algo, a.scale, tmpl, a.data_root, distribution,
+                     a.create_table, a.drop_tables)

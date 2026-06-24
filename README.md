@@ -484,18 +484,28 @@ run_matrix.py  = sweep base×quant cells for one --algo, generating configs + ca
 - `ivfpq` / `cagra` (GPU/cuVS): f32/f16 base + {float16,int8,uint8} quant on f32,
   {int8,uint8} quant on f16. (No bf16; int8/uint8 are L2-only.)
 
-### Table lifecycle (memory)
+### Table lifecycle (memory vs reload)
 
-By **default**, `--phase matrix` owns the table lifecycle **per base type**: it
-creates+loads a base table, runs every cell that uses it, then **drops the table**
-before the next base. Only one base table is resident at a time — without this,
-all base tables for a scale stay alive across the whole run (5 tables at once at
-88M → OOM). The test team can therefore run the matrix end-to-end with no manual
-cleanup.
+Table create/drop is controlled by explicit flags (like `run_wiki.py`); the
+fair per-cell index state is always guaranteed by the `drop_index` run inside
+**every** cell, independent of these flags:
 
-`--keep-tables` opts into the persistent workflow instead: run `--phase import`
-once, then `--phase matrix --keep-tables` (tables are neither created nor dropped
-by the matrix). Useful when sweeping many configs over the same imported tables.
+- `--create-table` — create + load each base table before its cells (import).
+- `--drop-tables` — drop each base table after its cells (frees its data so only
+  one base table is resident at a time).
+- *(neither)* — reuse pre-existing tables (run `--phase import` first, or a prior
+  `--create-table` run).
+
+Pick by box + scale:
+
+| Scenario | Flags |
+|---|---|
+| Small / OOM-prone box, end-to-end | `--create-table --drop-tables` (one base resident at a time) |
+| 88M / big box, load once then re-run | first run `--create-table`, re-runs no flag (reuse — no reload) |
+| Persistent sweep over many configs | `--phase import` once, then `--phase matrix` (no flag) |
+
+> Avoid `--drop-tables` at 88M — re-importing costs hours. Load once with
+> `--create-table`, then reuse (or re-measure individual cells with `run_wiki.py recall`).
 
 ### Usage
 
@@ -503,18 +513,16 @@ by the matrix). Useful when sweeping many configs over the same imported tables.
 # 0) one-time: point data-root at the datasets (symlink or --data-root)
 ln -s ../vector_benchmark/wiki_all_1M wiki_all_1M
 
-# 1) run the matrix per algorithm — imports + drops each base table itself.
-#    writes bench_matrix_<tag>.json (tag defaults to --algo).
-python run_matrix.py --phase matrix --scale 1M  --algo ivfflat
-python run_matrix.py --phase matrix --scale 1M  --algo ivfpq
-python run_matrix.py --phase matrix --scale 10M --algo cagra --distribution sharded
+# 1M / 10M on a small box — full cycle, one base table resident at a time
+python run_matrix.py --phase matrix --scale 1M  --algo ivfflat --create-table --drop-tables
+python run_matrix.py --phase matrix --scale 1M  --algo ivfpq   --create-table --drop-tables
 
-# 2) compare algorithms side-by-side (reads bench_matrix_{ivfflat,ivfpq,cagra}.json)
+# 88M — load once, reuse on re-runs (no reload); shard cagra/ivfpq if GPU is tight
+python run_matrix.py --phase matrix --scale 88M --algo ivfpq --create-table --distribution sharded
+python run_matrix.py --phase matrix --scale 88M --algo ivfpq                # re-run: reuses tables
+
+# compare algorithms side-by-side (reads bench_matrix_{ivfflat,ivfpq,cagra}.json)
 python aggregate.py
-
-# persistent variant: import once, then sweep with --keep-tables
-python run_matrix.py --phase import  --scale 1M --algo ivfpq
-python run_matrix.py --phase matrix  --scale 1M --algo ivfpq --keep-tables
 ```
 
 Generated per-cell configs land in `cfg/generated/` and the results in
