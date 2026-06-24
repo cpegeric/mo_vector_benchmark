@@ -20,7 +20,7 @@ in the template are RELATIVE to --data-root, so templates stay machine-neutral.
   python run_matrix.py --phase matrix --scale 1M  --algo ivfpq
   python run_matrix.py --phase matrix --scale 10M --algo cagra --distribution sharded
 
-Generated per-cell configs are written to cfg/bench/ (git-ignored).
+Generated per-cell configs are written to cfg/generated/ (git-ignored).
 """
 from __future__ import annotations
 
@@ -141,7 +141,7 @@ def make_cfg(algo, base_type, quant, database, tmpl, data_root, distribution):
 
 
 def write_cfg(cfg, name):
-    d = os.path.join(HERE, "cfg", "bench")
+    d = os.path.join(HERE, "cfg", "generated")
     os.makedirs(d, exist_ok=True)
     p = os.path.join(d, name)
     json.dump(cfg, open(p, "w"), indent=2)
@@ -174,102 +174,150 @@ def parse_recall(out):
     return m
 
 
+def import_base(algo, base, db, scale, tmpl, data_root, distribution):
+    """create_table (drops+recreates db) + load data for one base type.
+    Returns (ok, rows)."""
+    prefix = csv_prefix_for(base, tmpl["dataset"], data_root)
+    if not prefix:
+        print(f"!! no csv prefix configured for base={base}; skip"); return False, 0
+    cfg = make_cfg(algo, base, "float32", db, tmpl, data_root, distribution)
+    p = write_cfg(cfg, f"import_{scale}_{base}.json")
+    rc, out, _ = run(py("create_table", "--config", p))
+    if rc:
+        print(out[-2000:]); print(f"!! create_table failed base={base}"); return False, 0
+    rc, out, dt = run(py("import", "--config", p, "--input-csv-prefix", prefix))
+    ok = rc == 0 and "失败" not in out
+    rows = sum(int(x) for x in re.findall(r"affected_rows=(\d+)", out))
+    print(f"   import base={base}: rows={rows} time={dt:.1f}s ok={ok}")
+    if not ok:
+        print(out[-2000:])
+    return ok, rows
+
+
+def drop_database(tmpl, db):
+    """Drop the per-base database (and its table) to release memory between base
+    groups. run_wiki.py has no drop command, so do it directly like create_table."""
+    import pymysql
+    try:
+        c = pymysql.connect(host=tmpl.get("host", "127.0.0.1"), port=tmpl.get("port", 6001),
+                            user=tmpl.get("user", "dump"), password=tmpl.get("password", "111"))
+        with c.cursor() as cur:
+            cur.execute(f"DROP DATABASE IF EXISTS `{db}`")
+        c.commit(); c.close()
+        print(f"   dropped database {db}")
+    except Exception as e:   # noqa: BLE001
+        print(f"!! drop database {db} failed: {e}")
+
+
 def phase_import(algo, scale, tmpl, data_root, distribution):
+    # Standalone import for the --keep-tables persistent workflow. Import only the
+    # base types this algo's matrix references — GPU algos need just f32/f16.
     results = {}
-    ds = tmpl["dataset"]
-    # Import only the base types this algo's matrix references — GPU algos need
-    # just f32/f16, so 10M/88M scales without narrow CSVs still import cleanly.
-    bases = sorted({b for _, b, _ in cells(algo)})
-    for bt in bases:
+    for bt in sorted({b for _, b, _ in cells(algo)}):
         db = dbname(scale, bt)
-        prefix = csv_prefix_for(bt, ds, data_root)
-        if not prefix:
-            print(f"!! no csv prefix configured for base={bt}; skip"); continue
-        cfg = make_cfg(algo, bt, "float32", db, tmpl, data_root, distribution)
-        p = write_cfg(cfg, f"import_{scale}_{bt}.json")
-        print(f"\n===== IMPORT scale={scale} base={bt} db={db} prefix={prefix} =====", flush=True)
-        rc, out, _ = run(py("create_table", "--config", p))
-        if rc:
-            print(out[-2000:]); print(f"!! create_table failed base={bt}"); continue
-        rc, out, dt = run(py("import", "--config", p, "--input-csv-prefix", prefix))
-        ok = rc == 0 and "失败" not in out
-        rows = sum(int(x) for x in re.findall(r"affected_rows=(\d+)", out))
-        print(f"   import base={bt}: rows={rows} time={dt:.1f}s ok={ok}")
-        if not ok:
-            print(out[-2000:])
-        results[bt] = {"db": db, "rows": rows, "import_s": round(dt, 1), "ok": ok}
-    out_p = os.path.join(HERE, f"bench_import_{scale}.json")
-    json.dump(results, open(out_p, "w"), indent=2)
+        print(f"\n===== IMPORT scale={scale} base={bt} db={db} =====", flush=True)
+        ok, rows = import_base(algo, bt, db, scale, tmpl, data_root, distribution)
+        results[bt] = {"db": db, "rows": rows, "ok": ok}
+    json.dump(results, open(os.path.join(HERE, f"bench_import_{scale}.json"), "w"), indent=2)
     print(f"\nIMPORT[{scale}] SUMMARY:", json.dumps(results, indent=2))
 
 
-def phase_matrix(tag, algo, scale, tmpl, data_root, distribution):
-    rows = []
+def run_one_cell(tag, algo, scale, kind, base, quant, db, tmpl, data_root, distribution):
     probe_flat = tmpl["tuning"]["probe_ivfflat"]
-    for kind, base, quant in cells(algo):
+    cfg = make_cfg(algo, base, quant, db, tmpl, data_root, distribution)
+    name = f"{tag}_{scale}_{kind}_{base}_{quant}.json"
+    p = write_cfg(cfg, name)
+    label = f"{kind}: base={base} quant={quant} db={db} dist={distribution}"
+    print(f"\n===== {label} =====", flush=True)
+    # drop any existing index, then build (timed), then recall.
+    run(py("drop_index", "--config", p))
+    rc, out, build_s = run(py("create_index", "--config", p))
+    if rc:
+        print(out[-1500:])
+        return {"tag": tag, "scale": scale, "kind": kind, "base": base,
+                "quant": quant, "build_s": None, "error": "build_failed"}
+
+    def run_recall():
+        if base in ("int8", "uint8"):
+            # int8/uint8 base columns need integer-scaled query literals (the f32
+            # query can't cast to the narrow column); recall_narrow.py handles it.
+            return run([sys.executable, os.path.join(HERE, "recall_narrow.py"),
+                "--database", db, "--table", "hfb", "--mode", base,
+                "--query-fbin", abspath(data_root, tmpl["dataset"]["query_fbin"]),
+                "--groundtruth-ibin", abspath(data_root, tmpl["dataset"]["groundtruth_ibin"]),
+                "-n", str(N_QUERIES), "-k", str(K), "--probe", str(probe_flat),
+                "--concurrency", str(CONCURRENCY),
+                "--id-offset", str(tmpl["dataset"].get("id_offset", 1))])
+        return run(py("recall", "--config", p, "--gt-source", "fbin",
+                     "-n", str(N_QUERIES), "-k", str(K), "--concurrency", str(CONCURRENCY)))
+
+    # Cold/warm: pass 1 reads the freshly-built (uncached) index entry blocks
+    # cold; later passes hit the warm fileservice cache. Warm QPS/p50 is the
+    # MEDIAN of the post-cold passes (a transient on any one warm pass otherwise
+    # tanks the cell).
+    passes_met = []
+    for pi in range(PASSES):
+        _rc, out, _ = run_recall()
+        m = parse_recall(out)
+        passes_met.append(m)
+        print(f"   pass{pi+1}: qps={m.get('qps')} recall@{K}={m.get('recall')} "
+              f"p50={m.get('lat_p50')}ms", flush=True)
+
+    def _median(vals):
+        vals = sorted(v for v in vals if v is not None)
+        return vals[len(vals) // 2] if vals else None
+
+    cold = passes_met[0]
+    warm_passes = passes_met[1:] or passes_met
+    warm_qps = _median([m.get("qps") for m in warm_passes])
+    warm_p50 = _median([m.get("lat_p50") for m in warm_passes])
+    warm_recall = next((m.get("recall") for m in warm_passes if m.get("recall") is not None),
+                       cold.get("recall"))
+    rec = {"tag": tag, "scale": scale, "kind": kind, "base": base, "quant": quant,
+           "distribution": distribution, "build_s": round(build_s, 1),
+           "recall": warm_recall,
+           "qps_cold": cold.get("qps"), "qps_warm": warm_qps,
+           "p50_cold": cold.get("lat_p50"), "p50_warm": warm_p50,
+           "qps_passes": [m.get("qps") for m in passes_met]}
+    print(f"   -> build={build_s:.1f}s recall@{K}={warm_recall} "
+          f"qps_cold={cold.get('qps')} qps_warm={warm_qps} (median of {len(warm_passes)} warm) "
+          f"p50: {cold.get('lat_p50')}->{warm_p50}ms")
+    run(py("drop_index", "--config", p))
+    return rec
+
+
+def phase_matrix(tag, algo, scale, tmpl, data_root, distribution, keep_tables):
+    rows = []
+    # Group cells by base table, preserving order. The per-base table lifecycle
+    # (default) creates+loads a base table, runs all its cells, then DROPS it, so
+    # only ONE base table is resident at a time. Without it, every base table for
+    # the scale stays alive across the whole matrix (5 tables at once at 88M →
+    # OOM). --keep-tables opts into the persistent workflow: run --phase import
+    # first; tables are neither created nor dropped here.
+    order, by_base = [], {}
+    for c in cells(algo):
+        b = c[1]
+        if b not in by_base:
+            by_base[b] = []; order.append(b)
+        by_base[b].append(c)
+
+    for base in order:
         db = dbname(scale, base)
-        cfg = make_cfg(algo, base, quant, db, tmpl, data_root, distribution)
-        name = f"{tag}_{scale}_{kind}_{base}_{quant}.json"
-        p = write_cfg(cfg, name)
-        label = f"{kind}: base={base} quant={quant} db={db} dist={distribution}"
-        print(f"\n===== {label} =====", flush=True)
-        # drop any existing index, then build (timed), then recall.
-        run(py("drop_index", "--config", p))
-        rc, out, build_s = run(py("create_index", "--config", p))
-        if rc:
-            print(out[-1500:]); rows.append({"tag": tag, "scale": scale, "kind": kind,
-                "base": base, "quant": quant, "build_s": None, "error": "build_failed"})
-            continue
-
-        def run_recall():
-            if base in ("int8", "uint8"):
-                # int8/uint8 base columns need integer-scaled query literals (the f32
-                # query can't cast to the narrow column); recall_narrow.py handles it.
-                return run([sys.executable, os.path.join(HERE, "recall_narrow.py"),
-                    "--database", db, "--table", "hfb", "--mode", base,
-                    "--query-fbin", abspath(data_root, tmpl["dataset"]["query_fbin"]),
-                    "--groundtruth-ibin", abspath(data_root, tmpl["dataset"]["groundtruth_ibin"]),
-                    "-n", str(N_QUERIES), "-k", str(K), "--probe", str(probe_flat),
-                    "--concurrency", str(CONCURRENCY),
-                    "--id-offset", str(tmpl["dataset"].get("id_offset", 1))])
-            return run(py("recall", "--config", p, "--gt-source", "fbin",
-                         "-n", str(N_QUERIES), "-k", str(K), "--concurrency", str(CONCURRENCY)))
-
-        # Cold/warm: pass 1 reads the freshly-built (uncached) index entry blocks
-        # cold; later passes hit the warm fileservice cache. Warm QPS/p50 is the
-        # MEDIAN of the post-cold passes (a transient on any one warm pass otherwise
-        # tanks the cell).
-        passes_met = []
-        for pi in range(PASSES):
-            _rc, out, _ = run_recall()
-            m = parse_recall(out)
-            passes_met.append(m)
-            print(f"   pass{pi+1}: qps={m.get('qps')} recall@{K}={m.get('recall')} "
-                  f"p50={m.get('lat_p50')}ms", flush=True)
-
-        def _median(vals):
-            vals = sorted(v for v in vals if v is not None)
-            return vals[len(vals) // 2] if vals else None
-
-        cold = passes_met[0]
-        warm_passes = passes_met[1:] or passes_met
-        warm_qps = _median([m.get("qps") for m in warm_passes])
-        warm_p50 = _median([m.get("lat_p50") for m in warm_passes])
-        warm_recall = next((m.get("recall") for m in warm_passes if m.get("recall") is not None),
-                           cold.get("recall"))
-        rec = {"tag": tag, "scale": scale, "kind": kind, "base": base, "quant": quant,
-               "distribution": distribution, "build_s": round(build_s, 1),
-               "recall": warm_recall,
-               "qps_cold": cold.get("qps"), "qps_warm": warm_qps,
-               "p50_cold": cold.get("lat_p50"), "p50_warm": warm_p50,
-               "qps_passes": [m.get("qps") for m in passes_met]}
-        print(f"   -> build={build_s:.1f}s recall@{K}={warm_recall} "
-              f"qps_cold={cold.get('qps')} qps_warm={warm_qps} (median of {len(warm_passes)} warm) "
-              f"p50: {cold.get('lat_p50')}->{warm_p50}ms")
-        rows.append(rec)
-        run(py("drop_index", "--config", p))
-        # checkpoint after each cell
-        json.dump(rows, open(os.path.join(HERE, f"bench_matrix_{tag}.json"), "w"), indent=2)
+        if not keep_tables:
+            print(f"\n##### BASE {base} (db={db}) — import #####", flush=True)
+            ok, _ = import_base(algo, base, db, scale, tmpl, data_root, distribution)
+            if not ok:
+                print(f"!! import failed for base={base}; skipping its cells")
+                continue
+        try:
+            for kind, _b, quant in by_base[base]:
+                rows.append(run_one_cell(tag, algo, scale, kind, base, quant, db,
+                                         tmpl, data_root, distribution))
+                # checkpoint after each cell
+                json.dump(rows, open(os.path.join(HERE, f"bench_matrix_{tag}.json"), "w"), indent=2)
+        finally:
+            if not keep_tables:
+                drop_database(tmpl, db)   # free the base table before the next base
     print(f"\nMATRIX[{tag}] SUMMARY:\n" + json.dumps(rows, indent=2))
 
 
@@ -288,6 +336,10 @@ if __name__ == "__main__":
     ap.add_argument("--tag", default=None, help="bench_matrix_{tag}.json (default: --algo)")
     ap.add_argument("--passes", type=int, default=PASSES,
                     help="query passes per cell (pass1=cold, warm=median(rest))")
+    ap.add_argument("--keep-tables", action="store_true",
+                    help="persistent workflow: do NOT import/drop tables in --phase matrix "
+                         "(run --phase import first). Default drops each base table after its "
+                         "cells so only one base table is resident at a time (avoids OOM).")
     a = ap.parse_args()
 
     tmpl = load_template(a.scale)
@@ -297,4 +349,4 @@ if __name__ == "__main__":
     if a.phase == "import":
         phase_import(a.algo, a.scale, tmpl, a.data_root, distribution)
     else:
-        phase_matrix(tag, a.algo, a.scale, tmpl, a.data_root, distribution)
+        phase_matrix(tag, a.algo, a.scale, tmpl, a.data_root, distribution, a.keep_tables)

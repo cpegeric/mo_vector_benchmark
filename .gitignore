@@ -7,7 +7,7 @@ __pycache__/
 *.pyc
 
 # run_matrix.py generated per-cell configs (regenerated each run)
-cfg/bench/
+cfg/generated/
 
 # benchmark run outputs / scratch
 bench_matrix_*.json

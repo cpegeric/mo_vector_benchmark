@@ -484,24 +484,38 @@ run_matrix.py  = sweep base×quant cells for one --algo, generating configs + ca
 - `ivfpq` / `cagra` (GPU/cuVS): f32/f16 base + {float16,int8,uint8} quant on f32,
   {int8,uint8} quant on f16. (No bf16; int8/uint8 are L2-only.)
 
+### Table lifecycle (memory)
+
+By **default**, `--phase matrix` owns the table lifecycle **per base type**: it
+creates+loads a base table, runs every cell that uses it, then **drops the table**
+before the next base. Only one base table is resident at a time — without this,
+all base tables for a scale stay alive across the whole run (5 tables at once at
+88M → OOM). The test team can therefore run the matrix end-to-end with no manual
+cleanup.
+
+`--keep-tables` opts into the persistent workflow instead: run `--phase import`
+once, then `--phase matrix --keep-tables` (tables are neither created nor dropped
+by the matrix). Useful when sweeping many configs over the same imported tables.
+
 ### Usage
 
 ```sh
 # 0) one-time: point data-root at the datasets (symlink or --data-root)
+ln -s ../vector_benchmark/wiki_all_1M wiki_all_1M
 
-# 1) import once per scale (only the base tables the algo needs are loaded)
-python run_matrix.py --phase import --scale 1M --algo ivfpq
-
-# 2) run the matrix per algorithm; writes bench_matrix_<tag>.json (tag defaults to --algo)
+# 1) run the matrix per algorithm — imports + drops each base table itself.
+#    writes bench_matrix_<tag>.json (tag defaults to --algo).
 python run_matrix.py --phase matrix --scale 1M  --algo ivfflat
 python run_matrix.py --phase matrix --scale 1M  --algo ivfpq
 python run_matrix.py --phase matrix --scale 10M --algo cagra --distribution sharded
 
-# 3) compare algorithms side-by-side (reads bench_matrix_{ivfflat,ivfpq,cagra}.json)
+# 2) compare algorithms side-by-side (reads bench_matrix_{ivfflat,ivfpq,cagra}.json)
 python aggregate.py
+
+# persistent variant: import once, then sweep with --keep-tables
+python run_matrix.py --phase import  --scale 1M --algo ivfpq
+python run_matrix.py --phase matrix  --scale 1M --algo ivfpq --keep-tables
 ```
 
-Generated per-cell configs land in `cfg/bench/` and the results in
-`bench_matrix_*.json` / `bench_import_*.json` — all git-ignored. Tip: on a small
-GPU, restart mo-service between algorithms so the RMM pool + fileservice cache do
-not accumulate across runs.
+Generated per-cell configs land in `cfg/generated/` and the results in
+`bench_matrix_*.json` / `bench_import_*.json` — all git-ignored.
