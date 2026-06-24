@@ -40,6 +40,33 @@ cp cfg/s3_credentials.example.json cfg/s3_credentials.json
 | `dataset.s3` | 可选，S3 LOAD DATA 导入路径 |
 | `dataset.ann_s3` | 可选，召回用 ann 文件在 S3 上的位置 |
 
+#### `cfg.index` 建库参数（走 CREATE INDEX SQL，不再用 session 变量）
+
+索引构建参数统一写在 `cfg.index` 块里，由 `create_index` 直接拼进 `CREATE INDEX ...` 语句；
+不再依赖 `cfg.env` 里的 `SET kmeans_train_percent` / `SET *_max_index_capacity` 会话变量
+（CREATE INDEX 显式参数优先于会话变量，见 MO `ivfpq_create_gpu.go` 的 "flat algo_params key wins"）。
+`cfg.env` 仅保留真正的会话级开关（搜索期 `probe_limit`、`experimental_*_index`、`*_batch_window` 等）。
+
+| index 字段 | 适用索引 | 说明 / 生成的 SQL |
+|---|---|---|
+| `quantization` | **ivfflat** / cagra / ivfpq | ivfflat 现已支持：`float32`（不压缩，默认）/ `float16` / `bf16` / `int8` / `uint8`。条目按该窄类型存储（质心仍为 f32）；`int8`/`uint8` 走训练好的标量量化器。→ `quantization "int8"` |
+| `kmeans_train_percent` | ivfflat / ivfpq | kmeans 训练采样百分比（> 0 才生效）。→ `kmeans_train_percent 10` |
+| `kmeans_max_iteration` | ivfflat / ivfpq | kmeans 最大迭代次数（> 0 才生效）。→ `kmeans_max_iteration 20` |
+| `max_index_capacity` | cagra / ivfpq | 索引容量上限；**填 0 表示由服务端按行数自动决定**（不写入 SQL）。ivfflat 不支持，会被忽略。→ `max_index_capacity 1000000` |
+| `lists` | ivfflat / ivfpq | 聚类中心数。 |
+
+ivfflat 量化示例（`int8` 条目，f32 基列不变）：
+
+```json
+"index": {
+  "name": "idx_l2", "type": "ivfflat",
+  "lists": 1000, "op_type": "vector_l2_ops",
+  "quantization": "int8",
+  "kmeans_train_percent": 10,
+  "kmeans_max_iteration": 20
+}
+```
+
 ### 3. 下载 Wiki-all 数据集
 
 使用 [cuVS Bench Wiki-all 数据集](https://docs.rapids.ai/api/cuvs/nightly/cuvs_bench/wiki_all_dataset/) 进行测试（真实数据，**768 维**向量，`.fbin` 为 float32 二进制格式）。
@@ -422,3 +449,92 @@ python run_wiki.py recall --config cfg/ivfflat_10M.json \
 ```
 
 更多子命令说明：`python run_wiki.py -h`。
+
+---
+
+## 索引矩阵基准 run_matrix.py (base type × quantization sweep)
+
+`run_wiki.py` runs **one** operation against **one** config (any algorithm — the
+index type comes from the config). `run_matrix.py` is the **sweep driver**: for a
+chosen algorithm it generates a per-cell config and calls `run_wiki.py` for each
+`create_index → recall → drop_index`, recording build time, recall@k and QPS.
+
+```
+run_wiki.py    = one op,  one config   (create_table / import / create_index / recall)
+run_matrix.py  = sweep base×quant cells for one --algo, generating configs + calling run_wiki.py
+```
+
+### Scale, distribution, data root
+
+- `--scale {1M,10M,88M}` — loads `cfg/templates/<scale>.json` (per-scale dataset
+  paths + tuning: lists, probe, k-means %, cagra graph degrees).
+- `--distribution {single,sharded}` — GPU distribution for ivfpq/cagra. Defaults to
+  the template's value (1M/10M = `single`, 88M = `sharded`). Use `sharded` when one
+  GPU lacks memory for the dataset (e.g. 10M on a small card).
+- `--data-root PATH` — root for the **relative** dataset paths in the template.
+  Defaults to this repo dir, so put the datasets under the repo or symlink them:
+  ```
+  ln -s ../vector_benchmark/wiki_all_1M  wiki_all_1M
+  # or run with: --data-root ../vector_benchmark
+  ```
+
+### Algorithm cell-sets
+
+- `ivfflat` (CPU): 5 base types (f32/f16/bf16/int8/uint8) + 4 quant on f32 base.
+- `ivfpq` / `cagra` (GPU/cuVS): f32/f16 base + {float16,int8,uint8} quant on f32,
+  {int8,uint8} quant on f16. (No bf16; int8/uint8 are L2-only.)
+
+One invocation runs the **whole** cell-set for `--algo`. Narrow it with:
+
+- `--base {all,f32,f16,bf16,int8,uint8}` — run only one base type (default all).
+- `--quantize {all,none,float16,bf16,int8,uint8}` — run only one quantization;
+  `none` = the base-sweep cells (entries keep the base type). Default all.
+
+So `--base f32 --quantize int8` runs the single f32→int8 cell; `--base f32` runs
+all f32 cells; `--quantize none` runs just the base-sweep. Pairs with
+`--create-table`/`--drop-tables` to do one base group at a time without waiting
+for the rest.
+
+### Table lifecycle (memory vs reload)
+
+Table create/drop is controlled by explicit flags (like `run_wiki.py`); the
+fair per-cell index state is always guaranteed by the `drop_index` run inside
+**every** cell, independent of these flags:
+
+- `--create-table` — create + load each base table before its cells (import).
+- `--drop-tables` — drop each base table after its cells (frees its data so only
+  one base table is resident at a time).
+- *(neither)* — reuse pre-existing tables (run `--phase import` first, or a prior
+  `--create-table` run).
+
+Pick by box + scale:
+
+| Scenario | Flags |
+|---|---|
+| Small / OOM-prone box, end-to-end | `--create-table --drop-tables` (one base resident at a time) |
+| 88M / big box, load once then re-run | first run `--create-table`, re-runs no flag (reuse — no reload) |
+| Persistent sweep over many configs | `--phase import` once, then `--phase matrix` (no flag) |
+
+> Avoid `--drop-tables` at 88M — re-importing costs hours. Load once with
+> `--create-table`, then reuse (or re-measure individual cells with `run_wiki.py recall`).
+
+### Usage
+
+```sh
+# 0) one-time: point data-root at the datasets (symlink or --data-root)
+ln -s ../vector_benchmark/wiki_all_1M wiki_all_1M
+
+# 1M / 10M on a small box — full cycle, one base table resident at a time
+python run_matrix.py --phase matrix --scale 1M  --algo ivfflat --create-table --drop-tables
+python run_matrix.py --phase matrix --scale 1M  --algo ivfpq   --create-table --drop-tables
+
+# 88M — load once, reuse on re-runs (no reload); shard cagra/ivfpq if GPU is tight
+python run_matrix.py --phase matrix --scale 88M --algo ivfpq --create-table --distribution sharded
+python run_matrix.py --phase matrix --scale 88M --algo ivfpq                # re-run: reuses tables
+
+# compare algorithms side-by-side (reads bench_matrix_{ivfflat,ivfpq,cagra}.json)
+python aggregate.py
+```
+
+Generated per-cell configs land in `cfg/generated/` and the results in
+`bench_matrix_*.json` / `bench_import_*.json` — all git-ignored.

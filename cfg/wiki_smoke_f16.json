@@ -1,0 +1,28 @@
+{
+  "host": "127.0.0.1",
+  "port": 6001,
+  "user": "dump",
+  "password": "111",
+  "dimension": 768,
+  "env": {
+    "probe_limit": 3,
+    "ivf_preload_entries": 0
+  },
+  "dataset": {
+    "query_fbin": "/home/eric/github/vector_benchmark/wiki_all_1M/queries.fbin",
+    "groundtruth_ibin": "/home/eric/github/vector_benchmark/wiki_all_1M/groundtruth.1M.neighbors.ibin",
+    "id_offset": 1
+  },
+  "base_type": "f16",
+  "database": "wiki_smoke_f16",
+  "table": "hfb",
+  "index": {
+    "name": "idx_l2",
+    "type": "ivfflat",
+    "lists": 16,
+    "op_type": "vector_l2_ops",
+    "quantization": "float32",
+    "kmeans_train_percent": 50,
+    "kmeans_max_iteration": 10
+  }
+}

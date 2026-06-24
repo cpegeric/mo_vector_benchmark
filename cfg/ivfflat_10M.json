@@ -9,12 +9,14 @@
     "name": "idx_l2",
     "type": "ivfflat",
     "lists": 3162,
-    "op_type": "vector_l2_ops"
+    "op_type": "vector_l2_ops",
+    "quantization": "float32",
+    "kmeans_train_percent": 2,
+    "kmeans_max_iteration": 20
   },
   "dimension": 768,
   "env": {
     "probe_limit": 5,
-    "kmeans_train_percent": 2,
     "ivf_preload_entries": 0
   },
   "dataset": {

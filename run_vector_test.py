@@ -156,6 +156,16 @@ def _build_include_clause(index_cfg: dict) -> str:
     return " INCLUDE (" + ", ".join(f"`{c}`" for c in cols) + ")"
 
 
+def _first(index_cfg: dict, *keys):
+    """返回 keys 中第一个存在（非 None）的值，否则 None。用于兼容带前缀的键
+    （如 cagra_max_index_capacity / ivfpq_max_index_capacity）与通用键。"""
+    for k in keys:
+        v = index_cfg.get(k)
+        if v is not None:
+            return v
+    return None
+
+
 def build_create_index_sql(table: str, index_cfg: dict) -> str:
     """根据 index 配置构造 CREATE INDEX SQL。支持 cagra / ivfpq / ivfflat / hnsw。"""
     idx_name = index_cfg.get("name", "idx_l2")
@@ -165,10 +175,24 @@ def build_create_index_sql(table: str, index_cfg: dict) -> str:
 
     if idx_type == "ivfflat":
         lists = index_cfg.get("lists", 1000)
-        return (
+        sql = (
             f'CREATE INDEX {idx_name} USING ivfflat ON `{table}`(embedding) '
-            f'lists={lists} op_type "{dist}"{include_clause}'
+            f'lists={lists} op_type "{dist}"'
         )
+        # Index-build params passed as CREATE INDEX options (preferred over
+        # session variables). quantization: float32/float16/bf16/int8/uint8 —
+        # entries are stored in that narrow type (centroids stay f32); int8/uint8
+        # use the trained scalar quantizer. kmeans_train_percent /
+        # kmeans_max_iteration are the build knobs that used to be SET as session
+        # vars in cfg.env. (ivfflat does NOT support max_index_capacity.)
+        q = index_cfg.get("quantization")
+        if q:
+            sql += f' quantization "{q}"'
+        for key in ("kmeans_train_percent", "kmeans_max_iteration"):
+            val = index_cfg.get(key)
+            if val:  # 0 / None -> omit; the grammar requires these to be > 0
+                sql += f" {key} {val}"
+        return sql + include_clause
     if idx_type == "hnsw":
         m = index_cfg.get("m", 100)
         ef_c = index_cfg.get("ef_construction", 400)
@@ -183,24 +207,39 @@ def build_create_index_sql(table: str, index_cfg: dict) -> str:
         igd = index_cfg.get("intermediate_graph_degree", 128)
         gd = index_cfg.get("graph_degree", 64)
         itopk = index_cfg.get("itopk_size", 64)
-        return (
+        sql = (
             f'CREATE INDEX {idx_name} USING cagra ON `{table}`(embedding) '
             f'distribution_mode "{dm}" quantization "{q}" '
             f'intermediate_graph_degree={igd} graph_degree={gd} '
-            f'itopk_size={itopk} op_type "{dist}"{include_clause}'
+            f'itopk_size={itopk} op_type "{dist}"'
         )
+        mic = _first(index_cfg, "max_index_capacity", "cagra_max_index_capacity")
+        if mic:  # 0 / None -> omit (server auto = source row count); grammar needs > 0
+            sql += f" max_index_capacity {mic}"
+        return sql + include_clause
     if idx_type == "ivfpq":
         lists = index_cfg.get("lists", 1024)
         bits_per_code = index_cfg.get("bits_per_code", 8)
         m = index_cfg.get("m", 4)
         q = index_cfg.get("quantization", "float32")
         dm = index_cfg.get("distribution_mode", "single")
-        return (
+        sql = (
             f'CREATE INDEX {idx_name} USING ivfpq ON `{table}`(embedding) '
             f"LISTS {lists} BITS_PER_CODE {bits_per_code} M {m} "
             f"OP_TYPE '{dist}' QUANTIZATION '{q}' "
-            f"DISTRIBUTION_MODE '{dm}'{include_clause}"
+            f"DISTRIBUTION_MODE '{dm}'"
         )
+        # ivfpq build knobs as SQL params (were previously defined in cfg but
+        # never emitted).
+        opts = (
+            ("kmeans_train_percent", index_cfg.get("kmeans_train_percent")),
+            ("kmeans_max_iteration", index_cfg.get("kmeans_max_iteration")),
+            ("max_index_capacity", _first(index_cfg, "max_index_capacity", "ivfpq_max_index_capacity")),
+        )
+        for kw, val in opts:
+            if val:  # 0 / None -> omit; the grammar requires these to be > 0
+                sql += f" {kw} {val}"
+        return sql + include_clause
     raise ValueError(
         f"未知索引类型: {idx_type}（支持 cagra / ivfpq / ivfflat / hnsw）"
     )
@@ -264,12 +303,31 @@ def run_wiki_create_table(args):
             password=args.password,
             database=args.database,
         )
+        # Base (embedding) column type is configurable via cfg.base_type so the
+        # same wiki dataset can be loaded into f32 / f16 / bf16 / int8 / uint8
+        # columns (LOAD DATA casts the f32 text to the narrow type). dimension is
+        # also read from cfg (default 768).
+        _BASE_TYPE_SQL = {
+            "f32": "VECF32", "float32": "VECF32",
+            "f16": "VECF16", "float16": "VECF16",
+            "bf16": "VECBF16",
+            "int8": "VECINT8", "i8": "VECINT8",
+            "uint8": "VECUINT8", "u8": "VECUINT8",
+        }
+        _cfg = getattr(args, "_index_config", None) or {}
+        _base_type = str(_cfg.get("base_type", "f32")).lower()
+        _dim = int(_cfg.get("dimension", 768))
+        if _base_type not in _BASE_TYPE_SQL:
+            print(f"错误: 未知 base_type: {_base_type}（支持 {sorted(_BASE_TYPE_SQL)}）")
+            return 1
+        _col_type = f"{_BASE_TYPE_SQL[_base_type]}({_dim})"
+        print(f"  embedding 列类型: {_col_type}")
         create_table_sql = f"""
         CREATE TABLE `{args.table}` (
             `id` BIGINT NOT NULL AUTO_INCREMENT COMMENT '主键',
             `file_id` BIGINT NOT NULL,
             `content` TEXT DEFAULT NULL,
-            `embedding` VECF32(768) DEFAULT NULL,
+            `embedding` {_col_type} DEFAULT NULL,
             `page_num` INT NOT NULL DEFAULT 0,
             `meta` JSON DEFAULT NULL,
             PRIMARY KEY (`id`),

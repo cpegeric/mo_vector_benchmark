@@ -1,0 +1,31 @@
+{
+  "host": "127.0.0.1",
+  "port": 6001,
+  "user": "dump",
+  "password": "111",
+  "dimension": 768,
+  "dataset": {
+    "csv_prefix": "wiki_all_10M/gen/base.10M",
+    "csv_prefix_int8": "wiki_all_10M/gen_narrow/base.i8_",
+    "csv_prefix_uint8": "wiki_all_10M/gen_narrow/base.u8_",
+    "query_fbin": "wiki_all_10M/queries.fbin",
+    "groundtruth_ibin": "wiki_all_10M/groundtruth.10M.neighbors.ibin",
+    "id_offset": 1
+  },
+  "tuning": {
+    "ivfflat_lists": 3162,
+    "ivfpq_lists": 4096,
+    "ivfpq_m": 192,
+    "ivfpq_bits_per_code": 8,
+    "probe_ivfflat": 8,
+    "probe_ivfpq": 16,
+    "distribution_mode": "single",
+    "kmeans_train_percent": 2,
+    "kmeans_max_iteration": 20,
+    "cagra": {
+      "intermediate_graph_degree": 256,
+      "graph_degree": 64,
+      "itopk_size": 256
+    }
+  }
+}

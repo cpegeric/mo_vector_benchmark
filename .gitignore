@@ -5,3 +5,16 @@ venv/
 .cache/
 __pycache__/
 *.pyc
+
+# run_matrix.py generated per-cell configs (regenerated each run)
+cfg/generated/
+
+# benchmark run outputs / scratch
+bench_matrix_*.json
+bench_import*.json
+*.log
+memtrace*.log
+
+# datasets placed/symlinked under the repo (see --data-root)
+/wiki_all_*/
+/data/

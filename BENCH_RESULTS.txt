@@ -1,0 +1,48 @@
+
+===== build_s =====
+cell                  GPU+SIMD    GPU-noSIMD    noGPU+SIMD  noGPU-noSIMD
+base=f32                    25           128           160           146
+base=f16                    31            70            92           180
+base=bf16                   22            77            62            67
+base=int8                   17            23            26            50
+base=uint8                  15            22            26            49
+quant=float16               17            40            31            47
+quant=bf16                  15            21            27            44
+quant=int8                  13            16            24            47
+quant=uint8                 17            26            27            51
+
+===== recall =====
+cell                  GPU+SIMD    GPU-noSIMD    noGPU+SIMD  noGPU-noSIMD
+base=f32                 0.868         0.880         0.835         0.838
+base=f16                 0.886         0.886         0.833         0.839
+base=bf16                0.886         0.875         0.837         0.820
+base=int8                0.869         0.859         0.809         0.815
+base=uint8               0.864         0.869         0.804         0.804
+quant=float16            0.870         0.886         0.825         0.843
+quant=bf16               0.875         0.871         0.826         0.823
+quant=int8               0.848         0.845         0.805         0.806
+quant=uint8              0.854         0.860         0.814         0.808
+
+===== lat_p50 =====
+cell                  GPU+SIMD    GPU-noSIMD    noGPU+SIMD  noGPU-noSIMD
+base=f32                  1127          7382          7069          8716
+base=f16                   631          2608          6471          4766
+base=bf16                  475           467           502           577
+base=int8                  362           417           343           360
+base=uint8                 361          1197           288           347
+quant=float16              472           411           689           993
+quant=bf16                 327           460           485           361
+quant=int8                 168           188           214           219
+quant=uint8                428           263           375           291
+
+===== speedup factors (geomean across 9 cells) =====
+  [build_s]
+    SIMD on GPU build   (nosimd/simd): 1.98x slower without SIMD
+    SIMD on CPU build   (nosimd/simd): 1.57x slower without SIMD
+    GPU vs CPU (SIMD)   (cpu/gpu):      2.22x
+    GPU vs CPU (noSIMD) (cpu/gpu):      1.77x
+  [lat_p50]
+    SIMD on GPU build   (nosimd/simd): 1.64x slower without SIMD
+    SIMD on CPU build   (nosimd/simd): 1.01x slower without SIMD
+    GPU vs CPU (SIMD)   (cpu/gpu):      1.71x
+    GPU vs CPU (noSIMD) (cpu/gpu):      1.06x
