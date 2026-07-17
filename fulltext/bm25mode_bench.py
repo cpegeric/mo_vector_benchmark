@@ -117,11 +117,12 @@ def main():
     lat = {"ft2pf": [], "bm25": []}
     resd = {"ft2pf": [], "bm25": []}
     for toks in queries:
-        ftq = esc(" ".join(toks))          # space-separated → disjunction → searchWAND
-        bmq = esc("".join(toks))           # raw joined → bm25 tokenizes internally
+        # Native IN BM25 MODE: fulltext2 tokenizes the RAW query internally (gojieba),
+        # same as bm25 — so token sets match and the comparison is apples-to-apples.
+        bmq = esc("".join(toks))
         for engine, cur in curs.items():
             if engine == "ft2pf":
-                sql = f"SELECT id FROM t WHERE MATCH(body) AGAINST('{ftq}' IN BOOLEAN MODE) LIMIT {args.k}"
+                sql = f"SELECT id FROM t WHERE MATCH(body) AGAINST('{bmq}' IN BM25 MODE) LIMIT {args.k}"
             else:
                 sql = f"SELECT id FROM t WHERE bm25(body) AGAINST('{bmq}') LIMIT {args.k}"
             t0 = time.time()
