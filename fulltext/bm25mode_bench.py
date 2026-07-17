@@ -59,7 +59,7 @@ def build(cfg, csv, engine):
         "bm25": "CREATE INDEX ft USING bm25 ON t(body) WITH PARSER gojieba",
     }[engine]
     probe = {
-        "ft2pf": "SELECT COUNT(*) FROM (SELECT id FROM t WHERE MATCH(body) AGAINST('的' IN BOOLEAN MODE) LIMIT 1) x",
+        "ft2pf": "SELECT COUNT(*) FROM (SELECT id FROM t WHERE MATCH(body) AGAINST('的' IN BM25 MODE) LIMIT 1) x",
         "bm25": "SELECT COUNT(*) FROM (SELECT id FROM t WHERE bm25(body) AGAINST('的') LIMIT 1) x",
     }[engine]
     db = f"bm25mode_{engine}"
